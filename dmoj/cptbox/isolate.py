@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 from enum import Enum
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, List, Mapping, Sequence
 
 from dmoj.cptbox._cptbox import AT_FDCWD, Debugger, bsd_get_proc_cwd, bsd_get_proc_fdno
 from dmoj.cptbox.filesystem_policies import FilesystemAccessRule, FilesystemPolicy
@@ -45,8 +45,8 @@ class IsolateTracer(dict):
     def __init__(
         self,
         *,
-        read_fs: Sequence[FilesystemAccessRule],
-        write_fs: Sequence[FilesystemAccessRule],
+        read_fs: List[FilesystemAccessRule],
+        write_fs: List[FilesystemAccessRule],
         path_case_fixes=None,
         path_whitelist=None,
     ):
@@ -74,6 +74,7 @@ class IsolateTracer(dict):
                 sys_access: self.handle_file_access(FilesystemSyscallKind.READ, file_reg=0),
                 sys_readlink: self.handle_file_access(FilesystemSyscallKind.READ, file_reg=0),
                 sys_readlinkat: self.handle_file_access_at(FilesystemSyscallKind.READ, dir_reg=0, file_reg=1),
+                sys_chdir: self.handle_file_access(FilesystemSyscallKind.READ, file_reg=0),
                 sys_stat: self.handle_file_access(FilesystemSyscallKind.READ, file_reg=0),
                 sys_stat64: self.handle_file_access(FilesystemSyscallKind.READ, file_reg=0),
                 sys_lstat: self.handle_file_access(FilesystemSyscallKind.READ, file_reg=0),
@@ -148,6 +149,8 @@ class IsolateTracer(dict):
                 sys_getuid: ALLOW,
                 sys_getegid: ALLOW,
                 sys_getgid: ALLOW,
+                sys_setfsgid: ACCESS_EPERM,
+                sys_setfsuid: ACCESS_EPERM,
                 sys_getdents: ALLOW,
                 sys_lseek: ALLOW,
                 sys_getrusage: ALLOW,
@@ -408,12 +411,13 @@ class IsolateTracer(dict):
             if not fs_jail.check(real):
                 raise DeniedSyscall(ACCESS_EACCES, f'Denying {file}, real path {real}')
 
-    def _fix_path_case(self, file: str, orig_path: str, debugger: Debugger, ptr: int) -> str:
+    def _fix_path_case(self, full_path: str, orig_path: str, debugger: Debugger, ptr: int) -> str:
         # Windows is case-insensitive, while Unix is case-sensitive.
         # This makes some checkers that were originally written for Windows fail to work on Unix.
         # If required, we fix the path here, so the checker would work normally.
+        normalized = '/' + os.path.normpath(full_path).lstrip('/')
         for dest in self._path_case_fixes:
-            if dest.lower() == file.lower():
+            if dest.lower() == normalized.lower():
                 # file and dest are absolute paths, but the original path passed to the syscall can be relative.
                 # Due to potential difference in length, it's not possible to overwrite the original path with dest.
                 # We need to read that original path and apply the fix on it.
@@ -421,20 +425,22 @@ class IsolateTracer(dict):
                 # We need to fix the path to "post.inp".
 
                 # To keep it simple, we'll only fix the base name.
-                orig_basename = os.path.basename(file)  # "PoSt.InP" for the example above
+                orig_basename = os.path.basename(normalized)  # "PoSt.InP" for the example above
                 basename = os.path.basename(dest)  # "post.inp" for the example above
                 assert len(orig_basename) == len(basename)
 
                 if not orig_path.endswith(orig_basename):
                     # Looks like directory traversal is involved.
                     # For simplicity and safety, we won't apply any fix here.
-                    return file
+                    return full_path
 
                 fixed_path = orig_path[: -len(orig_basename)] + basename
                 self.write_path(debugger, ptr, fixed_path)
-                return file[: -len(fixed_path)] + fixed_path
 
-        return file
+                assert full_path.endswith(orig_path)
+                return full_path[: -len(fixed_path)] + fixed_path
+
+        return full_path
 
     def get_full_path(self, debugger: Debugger, file: str, dirfd: int = AT_FDCWD) -> str:
         dirfd = (dirfd & 0x7FFFFFFF) - (dirfd & 0x80000000)
@@ -458,9 +464,17 @@ class IsolateTracer(dict):
         PR_GET_DUMPABLE = 3
         PR_SET_NAME = 15
         PR_GET_NAME = 16
+        PR_CAPBSET_READ = 23
         PR_SET_THP_DISABLE = 41
         PR_SET_VMA = 0x53564D41  # Used on Android
-        if debugger.arg0 not in (PR_GET_DUMPABLE, PR_SET_NAME, PR_GET_NAME, PR_SET_THP_DISABLE, PR_SET_VMA):
+        if debugger.arg0 not in (
+            PR_GET_DUMPABLE,
+            PR_SET_NAME,
+            PR_GET_NAME,
+            PR_CAPBSET_READ,
+            PR_SET_THP_DISABLE,
+            PR_SET_VMA,
+        ):
             raise DeniedSyscall(protection_fault, f'Non-whitelisted prctl option: {debugger.arg0}')
 
     # ignore typing because of overload checks

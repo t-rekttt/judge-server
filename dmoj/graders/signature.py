@@ -2,14 +2,15 @@ import uuid
 
 from dmoj.error import InternalError
 from dmoj.executors import executors
+from dmoj.executors.base_executor import BaseExecutor
 from dmoj.graders.standard import StandardGrader
 from dmoj.utils.unicode import utf8bytes
 
 
 class SignatureGrader(StandardGrader):
-    def _generate_binary(self):
-        cpp_siggraders = ('C', 'C11', 'CPP03', 'CPP11', 'CPP14', 'CPP17', 'CPP20', 'CLANG', 'CLANGX')
-        java_siggraders = ('JAVA8', 'JAVA9', 'JAVA10', 'JAVA11', 'JAVA15', 'JAVA17')
+    def _generate_binary(self) -> BaseExecutor:
+        cpp_siggraders = ('C', 'C11', 'CPP03', 'CPP11', 'CPP14', 'CPP17', 'CPP20', 'CPPTHEMIS', 'CLANG', 'CLANGX')
+        java_siggraders = ('JAVA', 'JAVA8', 'JAVA9', 'JAVA10', 'JAVA11', 'JAVA15', 'JAVA17')
 
         if self.language in cpp_siggraders:
             aux_sources = {}
@@ -18,7 +19,7 @@ class SignatureGrader(StandardGrader):
             entry_point = self.problem.problem_data[handler_data['entry']]
             header = self.problem.problem_data[handler_data['header']]
 
-            submission_prefix = '#include "%s"\n' % handler_data['header']
+            submission_prefix = f'#include "{handler_data["header"]}"\n'
             if not handler_data.get('allow_main', False):
                 submission_prefix += '#define main main_%s\n' % uuid.uuid4().hex
 

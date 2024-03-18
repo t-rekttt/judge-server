@@ -52,6 +52,7 @@ sys_bindat: int
 sys_bpf: int
 sys_break: int
 sys_brk: int
+sys_cachestat: int
 sys_cap_enter: int
 sys_cap_fcntls_get: int
 sys_cap_fcntls_limit: int
@@ -148,6 +149,7 @@ sys_fchdir: int
 sys_fchflags: int
 sys_fchmod: int
 sys_fchmodat: int
+sys_fchmodat2: int
 sys_fchown: int
 sys_fchown32: int
 sys_fchownat: int
@@ -188,8 +190,11 @@ sys_ftruncate: int
 sys_ftruncate64: int
 sys_funlinkat: int
 sys_futex: int
+sys_futex_requeue: int
 sys_futex_time64: int
+sys_futex_wait: int
 sys_futex_waitv: int
+sys_futex_wake: int
 sys_futimens: int
 sys_futimes: int
 sys_futimesat: int
@@ -301,6 +306,7 @@ sys_kmq_timedreceive: int
 sys_kmq_timedsend: int
 sys_kmq_unlink: int
 sys_kqueue: int
+sys_kqueuex: int
 sys_kse_create: int
 sys_kse_exit: int
 sys_kse_release: int
@@ -340,6 +346,7 @@ sys_link: int
 sys_linkat: int
 sys_lio_listio: int
 sys_listen: int
+sys_listmount: int
 sys_listxattr: int
 sys_llistxattr: int
 sys_llseek: int
@@ -349,6 +356,9 @@ sys_lpathconf: int
 sys_lremovexattr: int
 sys_lseek: int
 sys_lsetxattr: int
+sys_lsm_get_self_attr: int
+sys_lsm_list_modules: int
+sys_lsm_set_self_attr: int
 sys_lstat: int
 sys_lstat64: int
 sys_lutimes: int
@@ -364,6 +374,7 @@ sys_mac_set_link: int
 sys_mac_set_proc: int
 sys_mac_syscall: int
 sys_madvise: int
+sys_map_shadow_stack: int
 sys_mbind: int
 sys_membarrier: int
 sys_memfd_create: int
@@ -656,6 +667,7 @@ sys_stat: int
 sys_stat64: int
 sys_statfs: int
 sys_statfs64: int
+sys_statmount: int
 sys_statx: int
 sys_stime: int
 sys_stty: int
