@@ -17,6 +17,7 @@ def decomment(x: bytes) -> bytes:
 
 class Executor(CompiledExecutor):
     ext = 'go'
+    restorable_from_cache = True
     nproc = -1
     data_grace = 98304  # Go uses data segment for heap arena map
     address_grace = 786432

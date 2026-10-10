@@ -31,7 +31,11 @@ from dmoj.utils.unicode import utf8bytes
 # from the cache.
 class _CompiledExecutorMeta(ExecutorMeta):
     def __call__(cls, *args, **kwargs) -> 'CompiledExecutor':
-        is_cached: bool = kwargs.pop('cached', False)
+        # `cache_all_compiled_binaries` also caches submissions, so a remote grading VM can hand them to other VMs.
+        # Only for executors whose cached form is fully described by `_executable` and `_dir` (see below).
+        is_cached: bool = kwargs.pop('cached', False) or bool(
+            env.cache_all_compiled_binaries and getattr(cls, 'restorable_from_cache', False)
+        )
         if is_cached:
             kwargs['dest_dir'] = env.compiled_binary_cache_dir
 
@@ -69,6 +73,9 @@ class CompiledExecutor(BaseExecutor, metaclass=_CompiledExecutorMeta):
     compile_output_index = 1
 
     is_cached = False
+    # Whether a cache hit, which restores only `_executable` and `_dir`, yields a runnable executor. False for
+    # executors that set other state while creating files (e.g. Java's class name, Python's loader path).
+    restorable_from_cache = False
     warning: Optional[bytes] = None
     _executable: Optional[str] = None
     _code: Optional[str] = None

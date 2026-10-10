@@ -11,14 +11,14 @@ from enum import Enum
 from http.server import HTTPServer
 from itertools import groupby
 from operator import itemgetter
-from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, NamedTuple, Optional, Set, Tuple
 
 from dmoj import packet
 from dmoj.control import JudgeControlRequestHandler
 from dmoj.error import CompileError
 from dmoj.judgeenv import env, get_supported_problems_and_mtimes, startup_warnings
 from dmoj.monitor import Monitor
-from dmoj.problem import BaseTestCase, BatchedTestCase, Problem, TestCase
+from dmoj.problem import Problem, TestCase
 from dmoj.result import Result
 from dmoj.utils import builtin_int_patch
 from dmoj.utils.ansi import ansi_style, print_ansi, strip_ansi
@@ -326,6 +326,7 @@ class JudgeWorker:
         self._sent_sigkill_to_worker_process = False
         # FIXME(tbrindus): marked Any pending grader cleanups.
         self.grader: Any = None
+        self.remote_session: Any = None
 
         self.mp_contex = multiprocessing.get_context('fork')
         self.worker_process_conn, child_conn = self.mp_contex.Pipe()
@@ -338,7 +339,8 @@ class JudgeWorker:
         child_conn.close()
 
     def communicate(self) -> Generator[Tuple[IPC, tuple], None, None]:
-        recv_timeout = max(60, int(2 * self.submission.time_limit))
+        # Remote grading creates VMs and downloads problem data before it reports anything.
+        recv_timeout = max(900 if env.remote_grading else 60, int(2 * self.submission.time_limit))
         while True:
             try:
                 if not self.worker_process_conn.poll(timeout=recv_timeout):
@@ -461,6 +463,15 @@ class JudgeWorker:
             self.grader = None
 
     def _grade_cases(self) -> Generator[Tuple[IPC, tuple], None, None]:
+        if env.remote_grading:
+            # Compile and run every case in disposable VMs; this process only orchestrates. Imported lazily so that
+            # local grading doesn't depend on the remote grading module.
+            from dmoj.remote.session import RemoteGradingSession
+
+            self.remote_session = RemoteGradingSession(self.submission)
+            yield from self.remote_session.run()
+            return
+
         problem = Problem(
             self.submission.problem_id,
             self.submission.time_limit,
@@ -484,17 +495,7 @@ class JudgeWorker:
 
         yield IPC.GRADING_BEGIN, (problem.run_pretests_only,)
 
-        flattened_cases: List[Tuple[Optional[int], BaseTestCase]] = []
-        batch_number = 0
-        batch_dependencies: List[Set[int]] = []
-        for case in problem.cases():
-            if isinstance(case, BatchedTestCase):
-                batch_number += 1
-                for batched_case in case.batched_cases:
-                    flattened_cases.append((batch_number, batched_case))
-                batch_dependencies.append(set(case.dependencies))
-            else:
-                flattened_cases.append((None, case))
+        flattened_cases, batch_dependencies = problem.flattened_cases()
 
         case_number = 0
         is_short_circuiting = False
@@ -569,6 +570,8 @@ class JudgeWorker:
         self._abort_requested = True
         if self.grader:
             self.grader.abort_grading()
+        if self.remote_session:
+            self.remote_session.abort()
 
 
 class ClassicJudge(Judge):
@@ -624,12 +627,20 @@ def main():  # pragma: no cover
     unicode_stdout_stderr()
     builtin_int_patch.apply()
 
-    if not sanity_check():
-        return 1
-
     from dmoj import judgeenv, contrib, executors
 
     judgeenv.load_env()
+
+    # With remote grading this process only orchestrates: it never compiles or runs code, so it doesn't need the
+    # sandbox. It still loads the executors (same image and runtime configuration as the VMs) to tell the site which
+    # languages the VMs support; run it with --skip-self-test, since the image's executors were tested when built.
+    if judgeenv.env.remote_grading:
+        from dmoj.remote.backend import make_backend
+
+        # VMs of submissions that were grading when this judge last stopped would otherwise run until auto-paused.
+        make_backend(judgeenv.env.remote, env['id']).delete_orphans()
+    elif not sanity_check():
+        return 1
 
     executors.load_executors()
     contrib.load_contrib_modules()

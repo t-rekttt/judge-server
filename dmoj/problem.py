@@ -7,6 +7,7 @@ import zipfile
 from collections import defaultdict
 from functools import partial
 from typing import (
+    Callable,
     DefaultDict,
     Dict,
     Iterable,
@@ -39,6 +40,9 @@ from dmoj.utils.normalize import normalized_file_copy
 
 if TYPE_CHECKING:
     from dmoj.graders.base import BaseGrader
+
+# Set by remote grading runners: (problem id, archive name) -> opened archive, or None to use the local file.
+remote_archive_opener: Optional[Callable[[str, str], Optional[zipfile.ZipFile]]] = None
 
 DEFAULT_TEST_CASE_INPUT_PATTERN = r'^(?=.*?\.in|in).*?(?:(?:^|\W)(?P<batch>\d+)[^\d\s]+)?(?P<case>\d+)[^\d\s]*$'
 DEFAULT_TEST_CASE_OUTPUT_PATTERN = r'^(?=.*?\.out|out).*?(?:(?:^|\W)(?P<batch>\d+)[^\d\s]+)?(?P<case>\d+)[^\d\s]*$'
@@ -223,6 +227,10 @@ class Problem:
 
     def _resolve_archive_files(self) -> Optional[zipfile.ZipFile]:
         if self.config.archive:
+            # Remote grading runners read the archive straight from storage, fetching only the members they open.
+            remote_archive = remote_archive_opener(self.id, self.config.archive) if remote_archive_opener else None
+            if remote_archive is not None:
+                return remote_archive
             archive_path = os.path.join(self.root_dir, self.config.archive)
             if not os.path.exists(archive_path):
                 raise InvalidInitException('archive file "%s" does not exist' % archive_path)
@@ -267,6 +275,26 @@ class Problem:
             test_cases = pretest_test_cases + test_cases
 
         return test_cases
+
+    def flattened_cases(self) -> Tuple[List[Tuple[Optional[int], 'TestCase']], List[Set[int]]]:
+        """
+        Flattens `cases()` into grading order. Returns `(batch_number or None, case)` pairs, where batch numbers count
+        from 1 in order of appearance, and the dependency set of each batch (indexed by batch number - 1).
+        """
+        flattened: List[Tuple[Optional[int], TestCase]] = []
+        batch_dependencies: List[Set[int]] = []
+        batch_number = 0
+        for case in self.cases():
+            if isinstance(case, BatchedTestCase):
+                batch_number += 1
+                for batched_case in case.batched_cases:
+                    assert isinstance(batched_case, TestCase)
+                    flattened.append((batch_number, batched_case))
+                batch_dependencies.append(set(case.dependencies))
+            else:
+                assert isinstance(case, TestCase)
+                flattened.append((None, case))
+        return flattened, batch_dependencies
 
 
 class ProblemDataManager(dict):

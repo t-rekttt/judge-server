@@ -61,6 +61,11 @@ env: ConfigNode = ConfigNode(
         'tempdir': None,
         # CPU affinity (as a list of 0-indexed CPU IDs) to run submissions on
         'submission_cpu_affinity': None,
+        # Cache submissions like auxiliary programs, so their compiled form can be reused (remote grading runners)
+        'cache_all_compiled_binaries': False,
+        # Grade in disposable VMs instead of locally; see docs/remote-grading.md for the `remote` settings
+        'remote_grading': False,
+        'remote': {},
     },
     dynamic=False,
 )

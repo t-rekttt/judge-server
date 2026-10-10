@@ -8,6 +8,7 @@ from dmoj.executors.compiled_executor import CompiledExecutor
 
 class Executor(CompiledExecutor):
     ext = 'pas'
+    restorable_from_cache = True
     command = 'fpc'
     compiler_read_fs = [
         ExactFile('/etc/fpc.cfg'),
