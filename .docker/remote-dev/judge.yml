@@ -1,0 +1,28 @@
+# Orchestrating judge for the local remote grading environment (docker-compose.yml next to this file).
+id: remote-dev
+key: remote-dev-key
+
+# Only used to tell the site which problems this judge can grade; the runners download problem data from storage.
+problem_storage_globs:
+  - /problems/*
+
+remote_grading: true
+remote:
+  max_vms: 4
+  backend: docker
+  docker:
+    image: vnoj/judge-microvm:dev
+    network: dmoj-remote-dev
+    user: 101
+    memory_mb: 2048
+    # Go builds its standard library from scratch in every fresh VM: ~18 CPU-seconds, over its 20 s compile limit
+    # on one vCPU. Size MicroVMs the same way.
+    cpus: 2
+  storage:
+    endpoint: http://s3:9000
+    bucket: problems
+    prefix: ''
+    access_key: remote-dev
+    secret_key: remote-dev-secret
+    region: us-east-1
+    url_expiry: 900

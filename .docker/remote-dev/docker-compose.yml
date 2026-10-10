@@ -1,0 +1,79 @@
+# Local environment for remote grading: an S3-compatible store holding the problems, a fake site that sends the
+# testsuite's submissions and checks what it stores, and a judge that grades every submission in runner containers
+# started with the same restrictions as DigitalOcean MicroVMs.
+#
+#   docker build -f .docker/microvm/Dockerfile -t vnoj/judge-microvm:dev .        (from the repository root)
+#   docker compose -f .docker/remote-dev/docker-compose.yml up --abort-on-container-exit --exit-code-from site
+#
+# Bucket data persists in .docker/remote-dev/data.
+name: dmoj-remote-dev
+
+networks:
+  default:
+    # Fixed name: the judge starts runner containers on it.
+    name: dmoj-remote-dev
+
+services:
+  s3:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: remote-dev
+      RUSTFS_SECRET_KEY: remote-dev-secret
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -so /dev/null http://localhost:9000/health || wget -qO /dev/null http://localhost:9000/health']
+      interval: 2s
+      retries: 30
+
+  upload:
+    image: vnoj/judge-microvm:dev
+    entrypoint: ['/env/bin/python3', '/remote-dev/upload_problems.py', '/problems', 'http://s3:9000', 'problems',
+                 'remote-dev', 'remote-dev-secret']
+    working_dir: /judge
+    volumes:
+      - ${PROBLEMS_DIR:-../../testsuite}:/problems:ro
+      - .:/remote-dev:ro
+    depends_on:
+      s3:
+        condition: service_healthy
+
+  site:
+    image: vnoj/judge-microvm:dev
+    entrypoint: ['/env/bin/python3', '/remote-dev/fake_site.py', '/problems', '9999', '${PROBLEMS:-.*}']
+    environment:
+      ABORT_AFTER: ${ABORT_AFTER:-}
+    volumes:
+      - ${PROBLEMS_DIR:-../../testsuite}:/problems:ro
+      - .:/remote-dev:ro
+    depends_on:
+      upload:
+        condition: service_completed_successfully
+
+  # Stand-in for DigitalOcean's MicroVM API, used with JUDGE_CONFIG=judge-microvm.yml.
+  microvm-api:
+    image: vnoj/judge-microvm:dev
+    entrypoint: ['/env/bin/python3', '/remote-dev/fake_microvm_api.py', '8090', 'fake-do-token', 'dmoj-remote-dev',
+                 'microvm-api']
+    user: root
+    volumes:
+      - .:/remote-dev:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  judge:
+    image: vnoj/judge-microvm:dev
+    # Orchestrating only: no ptrace or sandbox needed. It talks to the Docker Engine to create runners.
+    entrypoint: ['/env/bin/dmoj', '-c', '/remote-dev/${JUDGE_CONFIG:-judge.yml}', '--skip-self-test', '--no-watchdog',
+                 'site']
+    user: root
+    environment:
+      DMOJ_IN_DOCKER: '1'
+    volumes:
+      - ${PROBLEMS_DIR:-../../testsuite}:/problems:ro
+      - .:/remote-dev:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      site:
+        condition: service_started
+      microvm-api:
+        condition: service_started
