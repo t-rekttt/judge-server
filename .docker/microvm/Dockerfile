@@ -10,13 +10,15 @@ COPY .docker/microvm/entry /judge/.docker/microvm-entry
 COPY .docker/microvm/timing_benchmark.py .docker/microvm/compare_benchmarks.py .docker/microvm/create_checkpoint.py \
      /judge/.docker/microvm/
 # MicroVMs start the container as an arbitrary unprivileged uid (seen: 101, in group 0) instead of `judge` (1000).
-# Give group 0 the same access as the owner (OpenShift-style) on ~judge only, so that uid can use rustup/cargo and
-# Rust's shared build target, and let the entry register it in /etc/passwd (Node-based runtimes like scratch-run need
-# a home dir). The judge code and its Python environment are root-owned and group 0 would otherwise inherit write
-# access to them, so make them read-only for everyone but root.
-RUN chmod 755 /judge/.docker/microvm-entry && \
-	chgrp -R 0 /home/judge && chmod -R g=u /home/judge && \
-	chmod -R go-w,a+rX /judge /env /judge-runtime-paths.yml && \
+# - ~judge is mode 700: open it up (one directory, no copied layer). Everything under it is already world-readable,
+#   including the 1.5 GB Rust toolchain in ~/.rustup, which is only ever read.
+# - cargo writes its caches and Rust's shared build target under ~/.cargo, so give group 0 the owner's access there.
+# - The entry registers the uid in /etc/passwd: Node-based runtimes like scratch-run need a home directory.
+# - Some judge code and Python environment files are group-writable; group 0 must not modify them.
+# Changing only these paths keeps this layer small: a recursive chmod/chgrp copies every file it touches.
+RUN chmod 755 /judge/.docker/microvm-entry /home/judge && \
+	chgrp -R 0 /home/judge/.cargo && chmod -R g=u /home/judge/.cargo && \
+	find /judge /env /judge-runtime-paths.yml \( -perm -g+w -o -perm -o+w \) ! -type l -exec chmod go-w {} + && \
 	chmod g+w /etc/passwd
 
 ENV JUDGE_MODE=idle MICROVM_HTTP_PORT=8080
