@@ -23,7 +23,7 @@ from dmoj.judgeenv import env
 from dmoj.remote.backend import VM, VMBackend, make_backend
 from dmoj.remote.emitter import Emitter, UnitKey
 from dmoj.remote.protocol import Manifest
-from dmoj.remote.storage import problem_urls
+from dmoj.remote.storage import list_problem_objects, problem_urls
 
 if TYPE_CHECKING:
     from dmoj.judge import IPC, Submission
@@ -76,6 +76,7 @@ class RemoteGradingSession:
         wall_time = self.submission.time_limit * 3  # matches the default `wall_time_factor`
         self.grade_timeout = wall_time + REQUEST_MARGIN
 
+        self._problem_objects: Optional[List[str]] = None
         self._lock = threading.Lock()
         self._vms: List[VM] = []
         self._aborted = threading.Event()
@@ -120,7 +121,14 @@ class RemoteGradingSession:
         self._cleanup()
 
     def _problem_urls(self) -> dict:
-        return problem_urls(self.config.storage, self.submission.problem_id, self.submission.storage_namespace)
+        """Fresh presigned URLs for the problem's objects. The listing is done once per submission."""
+        sub = self.submission
+        if self._problem_objects is None:
+            objects = list_problem_objects(self.config.storage, sub.problem_id, sub.storage_namespace)
+            if not any(name == 'init.yml' for name, _ in objects):
+                raise RemoteGradingError(f'problem {sub.problem_id} has no init.yml in storage')
+            self._problem_objects = [name for name, _ in objects]
+        return problem_urls(self.config.storage, sub.problem_id, sub.storage_namespace, self._problem_objects)
 
     def _prepare(self, runner: Runner) -> None:
         sub = self.submission

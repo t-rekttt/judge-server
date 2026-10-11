@@ -1,0 +1,9 @@
+# Overlay for grading against real storage: no local S3 or upload, the site waits for nothing.
+# Runners still join the fixed network from docker-compose.yml; both projects can share it.
+services:
+  site:
+    depends_on: !reset []
+  judge:
+    depends_on:
+      site:
+        condition: service_started

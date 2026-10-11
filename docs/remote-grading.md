@@ -31,13 +31,16 @@ Code: `dmoj/remote/`
 
 ## Problem storage
 
-Each problem is two objects under `<prefix>/<storage namespace or "default">/<problem id>/`:
+Problems are stored exactly as they sit in a judge's problem directory, under
+`<prefix>/<storage namespace, if any>/<problem id>/`: `init.yml`, checkers, generators, and the test archive named by
+`archive:`. This is the layout judges already sync from (for VNOI: `tas-problems/tests/<problem>/`), so nothing is
+converted or uploaded twice.
 
-- **`files.zip`:** the problem directory (with `init.yml` at the top) minus its test archive: checkers, generators,
-  interactors. Every VM downloads and unpacks it, so it should stay small (limit 256 MiB).
-- **`archive.zip`:** the test archive named by `archive:` in `init.yml`, stored unchanged. No VM downloads it whole.
-  A VM reads the archive's file index from its end (one request of at most 1 MiB), then only the bytes of the cases it
-  grades, with HTTP range requests.
+For each submission the judge lists the problem's objects once. Then each VM:
+
+- **downloads every object except zip archives** (`init.yml`, checkers, generators, loose test data; 256 MiB limit);
+- **reads the test archive in place.** No VM downloads it whole. A VM reads the archive's file index from its end (one
+  request of at most 1 MiB), then only the bytes of the cases it grades, with HTTP range requests.
   - Opening a member requests exactly its bytes (in up to 64 MiB pieces), using the offsets and sizes in the
     archive's file index, so nothing past it is downloaded.
   - Measured locally: 40 cases in a 320 MiB archive, 4 VMs: 325 MiB fetched in total across all VMs (each case once),
@@ -45,12 +48,13 @@ Each problem is two objects under `<prefix>/<storage namespace or "default">/<pr
   - Cases graded from a generator need no archive reads.
 
 VMs get presigned GET URLs valid for `url_expiry` seconds, so they never hold storage credentials. Every `/grade`
-request carries fresh URLs, so grading never outlives them.
+request carries fresh URLs, so grading never outlives them. The storage key the judge holds only needs read and list
+access.
 
-Test data that isn't in an archive (cases listed directly in `init.yml`) is part of `files.zip`. Large problems
-should use `archive:`.
+Large problems should keep their test data in an archive: loose test files are downloaded by every VM.
 
-`.docker/remote-dev/upload_problems.py` uploads a problems directory in this layout.
+`.docker/remote-dev/upload_problems.py` uploads a local problems directory in this layout (used by the local test
+environment).
 
 The judge still needs `problem_storage_globs` (or `judge_version: 2` storages) to tell the site which problems it serves.
 
@@ -135,6 +139,11 @@ It prints `checkpoint_id` and `checkpoint_runner_token` for the judge's configur
 - **CPU-time accuracy depends on VMs not sharing CPUs.** Locally, 8 runners on a busy 40-core host measured 2.2× the
   normal CPU time per case and turned AC into TLE. With one dedicated CPU per runner, times matched local grading
   within 10%.
+- **Real MicroVMs are consistent.** Three 2-vCPU MicroVMs (AMD EPYC, `mkc1`) running the timing benchmark 50 times
+  each: CPU-bound work varied by 0.1–0.3% within a VM and 0.4% between VMs, with no CPU steal. Memory-bound work
+  varied more (5–7% within a VM, worst run +43% over the median), which is normal for cache-sensitive code on shared
+  hosts. The MicroVMs were about 1.8× faster than this development host, so time limits tuned for existing judges need
+  measuring against the VMs before contests.
 - **Go needs about 18 CPU-seconds to build its standard library in a fresh VM.** On one vCPU that exceeds Go's 20 s
   compile limit, so use 2 vCPUs (or pre-warm the Go build cache in the image).
 
@@ -154,8 +163,28 @@ It starts the following, and checks every result the way the VNOI bridge stores 
   "MicroVM" as a runner container;
 - the judge, which starts runners directly (`judge.yml`) or through the fake MicroVM API (`judge-microvm.yml`).
 
+To grade against real storage (and, optionally, real MicroVMs), `run-real-problems.sh <site dir> <judge config>` starts
+only the fake site and the judge. `<site dir>` holds `<problem>/init.yml` (so the judge can announce the problem) and
+`<problem>/tests/<case>/test.yml` with a source file, like the testsuite. The judge config carries real credentials;
+name it `judge-real-*.yml`, which git ignores.
+
+## Tested against DigitalOcean
+
+- VM lifecycle, endpoint auth (`Authorization` is consumed by the endpoint, so the runner's token travels in
+  `X-Runner-Token`), checkpoints, and orphan cleanup by tag: all verified against the real API.
+- From the registry image, a runner VM is ready in about 70 s; from a checkpoint, in a few seconds.
+- Account limits during the preview: 32 GiB of MicroVM memory in total (8 VMs of 4 GiB), 1000 VMs.
+- Grading VNOI's real problems from the real bucket (`tas-problems/tests/`, Singapore) on MicroVMs started from a
+  checkpoint in `mkc1`: 8 problems, 9 submissions covering AC, WA, TLE, a compile error and bridged checkers; every
+  stored verdict was correct and no VM was left behind.
+  - **Latency:** submissions took 11–44 s end to end. The floor was the compile error at 11 s, with a single VM: the
+    fixed cost of starting a VM from the checkpoint, listing and fetching the problem from a bucket in another region,
+    and compiling. A local judge reports a compile error in about a second. Remote grading trades that latency for
+    parallel test cases, so it pays off on problems with many or slow cases, not on small ones.
+  - **Speed:** the MicroVMs' CPU times were far below this development host's (a tight loop: 0.04 s against 0.42 s).
+    Time limits must be calibrated on the VMs, not carried over from existing judges.
+
 ## Not done yet
 
-- Not yet run against the real DigitalOcean API: needs preview access and a token. The fake API follows the published
-  spec, but the real service may differ (e.g. endpoint latency, rate limits, checkpoint restore time).
 - Rust recompiles in each VM: its build output lives outside the shared cache.
+- Problems whose test data isn't in an archive are downloaded whole by every VM.

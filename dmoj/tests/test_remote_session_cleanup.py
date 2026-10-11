@@ -88,7 +88,9 @@ class RemoteSessionCleanupTest(unittest.TestCase):
 
         with mock.patch('dmoj.remote.session.Runner.call', call), mock.patch(
             'dmoj.remote.session.Runner.download_artifact', return_value=b''
-        ), mock.patch('dmoj.remote.session.problem_urls', return_value={}):
+        ), mock.patch('dmoj.remote.session.problem_urls', return_value={}), mock.patch(
+            'dmoj.remote.session.list_problem_objects', return_value=[('init.yml', 10)]
+        ):
             messages = []
             if abort_after is not None:
                 threading.Timer(abort_after, session.abort).start()

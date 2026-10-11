@@ -1,7 +1,7 @@
 import datetime
 import unittest
 
-from dmoj.remote.storage import object_key, presign_get
+from dmoj.remote.storage import object_key, presign, presign_get
 
 
 class RemoteStorageTest(unittest.TestCase):
@@ -22,5 +22,21 @@ class RemoteStorageTest(unittest.TestCase):
         )
 
     def test_object_key(self):
-        self.assertEqual(object_key('problems/', 'aplusb', None, 'files.zip'), 'problems/default/aplusb/files.zip')
-        self.assertEqual(object_key('', 'aplusb', 'contest', 'archive.zip'), 'contest/aplusb/archive.zip')
+        self.assertEqual(object_key('tests/', 'aplusb', None, 'init.yml'), 'tests/aplusb/init.yml')
+        self.assertEqual(object_key('', 'aplusb', 'contest', 'data/1.in'), 'contest/aplusb/data/1.in')
+
+    def test_presign_signs_extra_query_parameters(self):
+        url = presign(
+            'GET',
+            'https://s3.example',
+            'bucket',
+            '',
+            'AK',
+            'SK',
+            'us-east-1',
+            60,
+            now=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+            params={'list-type': '2', 'prefix': 'tests/'},
+        )
+        self.assertIn('list-type=2&prefix=tests%2F', url)
+        self.assertTrue(url.startswith('https://s3.example/bucket?'))

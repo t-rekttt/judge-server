@@ -1,14 +1,15 @@
 """
 Where VMs get problem data: an S3-compatible bucket (AWS S3, DigitalOcean Spaces, RustFS...).
 
-Each problem is stored as two objects under `<prefix>/<namespace or "default">/<problem id>/`:
+Problems are stored exactly as they sit in a judge's problem directory, under
+`<prefix>/<storage namespace, if any>/<problem id>/`: `init.yml`, checkers, generators, and the test archive that
+`archive:` in init.yml names. This is the layout judges already sync from, so nothing is converted or uploaded twice.
 
-- `files.zip`: the problem directory (init.yml, checkers, generators...) without its test archive. VMs download and
-  unpack it whole, so it should stay small.
-- `archive.zip`: the test archive named by `archive:` in init.yml, stored as is. VMs never download it whole: they read
-  its central directory and then only the members of the cases they grade, with HTTP range requests.
+A VM lists the problem's objects, downloads the small ones (everything except zip archives) and reads the archive in
+place: only its central directory, then the members of the cases it grades, with HTTP range requests.
 
-VMs get short-lived presigned GET URLs for exactly these objects, so they never hold storage credentials.
+The orchestrating judge holds the storage credentials. VMs get presigned URLs for exactly the objects they need, valid
+for `url_expiry` seconds, re-sent with every request so grading never outlives them.
 
 Presigning is AWS Signature Version 4 query signing, implemented here to avoid adding an SDK to the judge image.
 """
@@ -17,31 +18,66 @@ import datetime
 import hashlib
 import hmac
 import urllib.parse
-from typing import Any, Dict, Optional
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Tuple
 
-FILES_OBJECT = 'files.zip'
-ARCHIVE_OBJECT = 'archive.zip'
+import requests
+
+LIST_NAMESPACE = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+
+
+def problem_prefix(prefix: str, problem_id: str, namespace: Optional[str]) -> str:
+    parts = [part for part in (prefix.strip('/'), namespace, problem_id) if part]
+    return '/'.join(parts) + '/'
 
 
 def object_key(prefix: str, problem_id: str, namespace: Optional[str], name: str) -> str:
-    parts = [part for part in (prefix.strip('/'), namespace or 'default', problem_id, name) if part]
-    return '/'.join(parts)
+    return problem_prefix(prefix, problem_id, namespace) + name
 
 
-def problem_urls(config: Any, problem_id: str, namespace: Optional[str]) -> Dict[str, str]:
-    """Fresh presigned URLs for both objects. The archive URL is used only if init.yml names an archive."""
+def list_problem_objects(config: Any, problem_id: str, namespace: Optional[str]) -> List[Tuple[str, int]]:
+    """Names (relative to the problem) and sizes of the problem's objects, through a presigned ListObjectsV2."""
+    prefix = problem_prefix(config.prefix or '', problem_id, namespace)
+    objects: List[Tuple[str, int]] = []
+    token: Optional[str] = None
+    while True:
+        params = {'list-type': '2', 'prefix': prefix, 'max-keys': '1000'}
+        if token:
+            params['continuation-token'] = token
+        url = _presign_config(config, 'GET', '', params)
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        for item in root.findall('s3:Contents', LIST_NAMESPACE):
+            key = item.findtext('s3:Key', namespaces=LIST_NAMESPACE) or ''
+            name = key[len(prefix) :]
+            if name and not name.endswith('/'):
+                objects.append((name, int(item.findtext('s3:Size', default='0', namespaces=LIST_NAMESPACE))))
+        token = root.findtext('s3:NextContinuationToken', namespaces=LIST_NAMESPACE)
+        if not token:
+            return objects
+
+
+def problem_urls(config: Any, problem_id: str, namespace: Optional[str], names: List[str]) -> Dict[str, str]:
+    """Fresh presigned GET URLs for the named objects of a problem."""
     return {
-        name: presign_get(
-            endpoint=config.endpoint,
-            bucket=config.bucket,
-            key=object_key(config.prefix or '', problem_id, namespace, name),
-            access_key=config.access_key,
-            secret_key=config.secret_key,
-            region=config.region or 'us-east-1',
-            expires=int(config.url_expiry or 900),
-        )
-        for name in (FILES_OBJECT, ARCHIVE_OBJECT)
+        name: _presign_config(config, 'GET', object_key(config.prefix or '', problem_id, namespace, name))
+        for name in names
     }
+
+
+def _presign_config(config: Any, method: str, key: str, params: Optional[Dict[str, str]] = None) -> str:
+    return presign(
+        method,
+        endpoint=config.endpoint,
+        bucket=config.bucket,
+        key=key,
+        access_key=config.access_key,
+        secret_key=config.secret_key,
+        region=config.region or 'us-east-1',
+        expires=int(config.url_expiry or 900),
+        params=params,
+    )
 
 
 def _sign(key: bytes, message: str) -> bytes:
@@ -62,8 +98,12 @@ def presign(
     region: str,
     expires: int,
     now: Optional[datetime.datetime] = None,
+    params: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Presigned path-style URL for `method` on `<endpoint>/<bucket>/<key>`, valid for `expires` seconds."""
+    """
+    Presigned path-style URL for `method` on `<endpoint>/<bucket>/<key>`, valid for `expires` seconds. `params` are
+    extra query parameters that become part of the signed request (e.g. a ListObjectsV2 query on the bucket).
+    """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     amz_date = now.strftime('%Y%m%dT%H%M%SZ')
     date = now.strftime('%Y%m%d')
@@ -76,6 +116,7 @@ def presign(
     base_path = parsed.path.rstrip('/')
 
     query = {
+        **(params or {}),
         'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
         'X-Amz-Credential': f'{access_key}/{scope}',
         'X-Amz-Date': amz_date,

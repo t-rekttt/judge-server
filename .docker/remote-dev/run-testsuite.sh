@@ -12,10 +12,15 @@ docker build -q -f ../microvm/Dockerfile -t vnoj/judge-microvm:dev ../.. >/dev/n
 mkdir -p data
 docker run --rm -v "$PWD/data:/d" alpine:latest chown -R 10001:10001 /d
 
+# Runner containers are labelled with their judge's id; only touch this judge's, so another stack running at the
+# same time (e.g. run-real-problems.sh) keeps its runners.
+judge_id=$(sed -n 's/^id: *//p' "${JUDGE_CONFIG:-judge.yml}" | head -1)
+runner_filter="label=dmoj.judge=${judge_id}"
+
 cleanup() {
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
   rm -f judge-microvm-checkpoint.yml
-  docker ps -aq --filter label=dmoj.remote-runner | xargs -r docker rm -f >/dev/null || true
+  docker ps -aq --filter "$runner_filter" | xargs -r docker rm -f >/dev/null || true
 }
 trap cleanup EXIT
 
@@ -44,7 +49,7 @@ docker compose logs --no-color --no-log-prefix site
 
 # Every VM must be gone once grading is over (the judge deletes them as each submission ends).
 sleep 5
-leaked=$(docker ps -q --filter label=dmoj.remote-runner | wc -l)
+leaked=$(docker ps -q --filter "$runner_filter" | wc -l)
 echo "Runner VMs left after grading: $leaked"
 [ "$leaked" = 0 ] || status=1
 exit "$status"

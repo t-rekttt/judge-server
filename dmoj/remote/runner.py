@@ -3,7 +3,7 @@ Grading service that runs inside each VM: `python -m dmoj.remote.runner`.
 
 The orchestrating judge drives it over HTTP, one submission per VM:
 
-    POST /prepare   {submission, problem: urls}   download the problem's small files; the test archive stays remote
+    POST /prepare   {submission, problem: urls}   download the problem's files except zip archives, which stay remote
     POST /compile   {grade_first}                 compile (a cache hit after POST /artifact); returns a compile error,
                                                   or the case manifest, plus case 1's result if `grade_first`
     GET  /artifact                                compiled programs, for other VMs of the same submission
@@ -21,7 +21,6 @@ graded exactly as a local judge grades it.
 
 import argparse
 import hmac
-import io
 import json
 import logging
 import os
@@ -43,7 +42,6 @@ from dmoj import judgeenv
 from dmoj.remote import artifact
 from dmoj.remote.protocol import Manifest, make_case_info, result_to_dict
 from dmoj.remote.range_file import HTTPRangeFile, open_remote_zip
-from dmoj.remote.storage import ARCHIVE_OBJECT, FILES_OBJECT
 from dmoj.utils import builtin_int_patch
 from dmoj.utils.unicode import utf8bytes
 
@@ -55,7 +53,7 @@ logger = logging.getLogger('dmoj.remote.runner')
 
 # Problem data is unpacked to <root>/<problem id>, so the judge's regular problem lookup finds it.
 PROBLEMS_ROOT = os.path.join(tempfile.gettempdir(), 'dmoj-problems')
-# Problem files without the test archive: checkers, generators, init.yml.
+# Problem files other than zip archives: checkers, generators, init.yml, loose test data.
 MAX_PROBLEM_FILES = 256 * 1024**2
 
 
@@ -73,6 +71,8 @@ class RunnerState:
         self.grader: Any = None
         self.cases: Dict[int, 'TestCase'] = {}
         self.archive_file: Optional[HTTPRangeFile] = None
+        self.archive_name: Optional[str] = None
+        # Presigned URL per object of the problem, by name relative to the problem.
         self.urls: Dict[str, str] = {}
 
     def prepare(self, data: dict) -> None:
@@ -91,7 +91,7 @@ class RunnerState:
             meta=sub['meta'],
         )
         self.urls = data['problem']
-        _download_problem(self.submission.problem_id, self.urls[FILES_OBJECT])
+        _download_problem(self.submission.problem_id, self.urls)
 
     def compile(self, grade_first: bool) -> dict:
         from dmoj.error import CompileError
@@ -128,17 +128,20 @@ class RunnerState:
             reply['first_result'] = self.grade(1)
         return reply
 
-    def open_remote_archive(self, problem_id: str, name: str) -> zipfile.ZipFile:
+    def open_remote_archive(self, problem_id: str, name: str) -> Optional[zipfile.ZipFile]:
         """Opens the problem's test archive from storage; members are fetched with range requests when read."""
-        archive = open_remote_zip(self.urls[ARCHIVE_OBJECT])
+        if name not in self.urls:
+            return None  # not in storage: the regular local lookup reports it missing
+        archive = open_remote_zip(self.urls[name])
         self.archive_file = archive.raw
+        self.archive_name = name
         return archive
 
     def refresh_urls(self, urls: Optional[Dict[str, str]]) -> None:
         if urls:
             self.urls = urls
-            if self.archive_file is not None:
-                self.archive_file.url = urls[ARCHIVE_OBJECT]
+            if self.archive_file is not None and self.archive_name in urls:
+                self.archive_file.url = urls[self.archive_name]
 
     def grade(self, position: int) -> dict:
         assert self.grader is not None, 'compile first'
@@ -174,24 +177,29 @@ class RunnerState:
                 reply.put((False, error))
 
 
-def _download_problem(problem_id: str, url: str) -> None:
-    """Fetches the problem's directory, minus its test archive, as a zip and unpacks it."""
+def _download_problem(problem_id: str, urls: Dict[str, str]) -> None:
+    """Fetches the problem's files into its directory, except zip archives, which are read in place from storage."""
     if '/' in problem_id or problem_id in ('', '.', '..'):
         raise ValueError(f'invalid problem id: {problem_id!r}')
-    with urllib.request.urlopen(url, timeout=60) as response:
-        data = response.read(MAX_PROBLEM_FILES + 1)
-    if len(data) > MAX_PROBLEM_FILES:
-        raise ValueError('problem files too large')
-
-    destination = os.path.join(PROBLEMS_ROOT, problem_id)
+    destination = os.path.realpath(os.path.join(PROBLEMS_ROOT, problem_id))
     shutil.rmtree(destination, ignore_errors=True)
     os.makedirs(destination)
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        for name in archive.namelist():
-            path = os.path.realpath(os.path.join(destination, name))
-            if not path.startswith(os.path.realpath(destination) + os.sep):
-                raise ValueError(f'unsafe path in problem archive: {name}')
-        archive.extractall(destination)
+
+    remaining = MAX_PROBLEM_FILES
+    for name, url in urls.items():
+        if name.lower().endswith('.zip'):
+            continue
+        path = os.path.realpath(os.path.join(destination, name))
+        if not path.startswith(destination + os.sep):
+            raise ValueError(f'unsafe path in problem: {name}')
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read(remaining + 1)
+        remaining -= len(data)
+        if remaining < 0:
+            raise ValueError('problem files too large')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(data)
 
 
 class RunnerHandler(BaseHTTPRequestHandler):
