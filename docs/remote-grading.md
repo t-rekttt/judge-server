@@ -193,9 +193,9 @@ name it `judge-real-*.yml`, which git ignores.
 - VM lifecycle, endpoint auth (`Authorization` is consumed by the endpoint, so the runner's token travels in
   `X-Runner-Token`), checkpoints, and orphan cleanup by tag: all verified against the real API.
 - From the registry image, a runner VM is ready in about 70 s; from a checkpoint, in a few seconds.
-- Account limits during the preview: 32 GiB of MicroVM memory in total (16 VMs of 2 GiB), 1000 VMs. A
-  `max_concurrent_vms` above that is allowed in the configuration, but DigitalOcean refuses creations past the limit;
-  the judge keeps grading on the VMs it has and retries. Ask DigitalOcean to raise the limit.
+- Account limits during the preview: the API reports 32 GiB of MicroVM memory in total, but that isn't enforced:
+  20 VMs of 2 GiB were accepted at once in a test, and the account owner has run 500. If creations are ever refused,
+  the judge keeps grading on the VMs it has and retries.
 - A checkpoint stores the VM's whole allocated disk plus RAM, not just what is used: 52 GiB for the 1 vCPU / 2 GiB
   size (50 GB disk), 84 GiB for 2 vCPU / 4 GiB. At the documented $0.05/GiB-month that is a few dollars a month per
   checkpoint; keep one, and recreate it after image changes.
