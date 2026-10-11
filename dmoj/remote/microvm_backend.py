@@ -33,8 +33,9 @@ RUNNER_TAG = 'dmoj-remote-runner'
 # Seconds to wait for a VM to reach `running` with an active endpoint, then for its runner to answer.
 DEFAULT_READY_TIMEOUT = 300
 API_ATTEMPTS = 5
-# The longest idle time before the platform pauses a VM that this account's tier allows (4 hours).
-AUTO_PAUSE_IDLE_TIMEOUT = '4h'
+# Idle time before the platform pauses a VM: a safeguard so a leaked VM stops costing money. The judge keeps the VMs
+# it still uses awake (parked ones are pinged every two minutes), so only a VM nobody owns anymore gets paused.
+AUTO_PAUSE_IDLE_TIMEOUT = '5m'
 # Polling a starting VM: first wait, then doubling up to the cap.
 POLL_INITIAL = 1.0
 POLL_MAX = 4.0
@@ -123,10 +124,8 @@ class MicroVMBackend(VMBackend):
         request: Dict[str, Any] = {
             'name': name,
             'tags': [RUNNER_TAG, self.judge_tag],
-            # Standby VMs sit idle for as long as nobody submits. The platform pauses an idle VM (auto-pause can't
-            # be disabled, only delayed up to the account's maximum), and a paused one fails its health check when a
-            # submission finally takes it, so the submission waits for a new VM after all. The judge keeps parked
-            # VMs awake by pinging them well within this timeout; leaked VMs are the sweeper's job.
+            # A leaked VM pauses after this long idle, so it stops costing money until the sweeper deletes it.
+            # Parked VMs are pinged well within this timeout, so they stay awake for the next submission.
             'auto_pause': {'idle_timeout': AUTO_PAUSE_IDLE_TIMEOUT},
         }
         if self.checkpoint_id:

@@ -727,7 +727,8 @@ def main():  # pragma: no cover
         from dmoj.remote.backend import VM
         from dmoj.remote.session import DEFAULT_WARM_IDLE_SECONDS
 
-        # Parked VMs are pinged this often (seconds); far below the platform's auto-pause timeout.
+        # Parked VMs are pinged this often (seconds): well within the platform's 5-minute auto-pause timeout, so
+        # the standby reserve stays awake, while a VM the judge lost track of pauses as a safeguard.
         KEEPALIVE_INTERVAL = 120
 
         warm_idle = remote.warm_idle_seconds
