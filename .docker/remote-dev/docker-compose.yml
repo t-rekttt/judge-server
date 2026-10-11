@@ -44,6 +44,7 @@ services:
     environment:
       ABORT_AFTER: ${ABORT_AFTER:-}
       JUDGE_COUNT: ${JUDGE_COUNT:-1}
+      DROP_JUDGE_AFTER: ${DROP_JUDGE_AFTER:-}
     volumes:
       - ${PROBLEMS_DIR:-../../testsuite}:/problems:ro
       - .:/remote-dev:ro

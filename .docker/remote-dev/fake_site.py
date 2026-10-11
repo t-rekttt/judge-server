@@ -42,10 +42,20 @@ class Connection:
     def __init__(self, sock: socket.socket) -> None:
         self.sock = sock
         self.input = sock.makefile('rb')
+        self._send_lock = threading.Lock()
 
     def send(self, packet: dict) -> None:
         raw = zlib.compress(json.dumps(packet).encode())
-        self.sock.sendall(SIZE.pack(len(raw)) + raw)
+        with self._send_lock:
+            self.sock.sendall(SIZE.pack(len(raw)) + raw)
+
+    def drop(self) -> None:
+        """Closes the connection from the site's side, like a bridge restart does."""
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
 
     def receive(self) -> dict:
         header = self.input.read(SIZE.size)
@@ -136,7 +146,13 @@ def grade(conn: Connection, sub_id: int, problem: str, config: dict, source: str
     while True:
         packet = conn.receive()
         name = packet['name']
-        if name in ('submission-acknowledged', 'grading-begin', 'compile-message', 'supported-problems'):
+        if name in (
+            'submission-acknowledged',
+            'grading-begin',
+            'compile-message',
+            'supported-problems',
+            'ping-response',
+        ):
             continue
         if name == 'batch-begin':
             batch_id += 1
@@ -205,8 +221,37 @@ def main() -> None:
     # Every judge takes the next queued submission it can grade, like the site's bridge handing out work.
     queue = list(enumerate(submissions, start=1))
     lock = threading.Lock()
-    totals = {'graded': 0, 'failures': 0}
+    totals = {'graded': 0, 'failures': 0, 'dropped': 0, 'in_flight': 0}
     started = time.monotonic()
+    expected = len(queue)
+
+    # DROP_JUDGE_AFTER=<seconds>: close the last judge's connection while it grades, as a site restart would. The
+    # judge must reconnect (counted below) and the others must keep grading; the dropped submission is requeued.
+    drop_after = float(os.environ.get('DROP_JUDGE_AFTER') or 0)
+    reconnected: list = []
+    dropped_once = threading.Event()
+
+    def accept_reconnections() -> None:
+        while True:
+            for name, conn, executors in connect_judges(server, 1):
+                reconnected.append(name)
+                print(f'Judge {name} reconnected', flush=True)
+                threading.Thread(target=judge_loop, args=(name, conn, executors), daemon=True).start()
+
+    if drop_after:
+        threading.Thread(target=accept_reconnections, daemon=True).start()
+
+    def ping_forever(conn: Connection) -> None:
+        # The bridge pings every few seconds; a judge closes a connection silent for 300 s.
+        while True:
+            time.sleep(10)
+            try:
+                conn.send({'name': 'ping', 'when': time.time()})
+            except OSError:
+                return
+
+    for _, conn, _ in judges:
+        threading.Thread(target=ping_forever, args=(conn,), daemon=True).start()
 
     def judge_loop(name: str, conn: Connection, executors: set) -> None:
         while True:
@@ -222,14 +267,27 @@ def main() -> None:
                 if index is None:
                     return
                 sub_id, (problem, case, config, source) = queue.pop(index)
+                totals['in_flight'] += 1
             begin = time.monotonic()
-            stored, outcome, details = grade(conn, sub_id, problem, config, source)
+            if drop_after and name == judges[-1][0] and not dropped_once.is_set():
+                dropped_once.set()
+                threading.Timer(drop_after, conn.drop).start()
+            try:
+                stored, outcome, details = grade(conn, sub_id, problem, config, source)
+            except (ConnectionError, OSError, ValueError, EOFError, zlib.error):
+                with lock:
+                    totals['dropped'] += 1
+                    totals['in_flight'] -= 1
+                    queue.insert(0, (sub_id, (problem, case, config, source)))
+                print(f'[dropped] {problem}/{case} on {name}: connection closed mid-grading, requeued', flush=True)
+                return
             errors = check(config, stored, outcome)
             times = sorted(case['time'] for case in stored.values() if case['status'] != 'SC')
             cpu = f', CPU per case median {times[len(times) // 2]:.2f}s max {times[-1]:.2f}s' if times else ''
             status = 'ok' if not errors else 'FAIL'
             with lock:
                 totals['graded'] += 1
+                totals['in_flight'] -= 1
                 totals['failures'] += bool(errors)
                 print(
                     f'[{status}] {problem}/{case} ({config["language"]}): {outcome}, {len(stored)} cases, '
@@ -245,16 +303,31 @@ def main() -> None:
     threads = [threading.Thread(target=judge_loop, args=judge, daemon=True) for judge in judges]
     for thread in threads:
         thread.start()
-    for thread in threads:
-        thread.join()
+    # Submissions requeued by a dropped judge are graded by its reconnected loop, so wait on the counts, not the
+    # original threads. A submission skipped by every judge (unsupported language) is never counted as graded.
+    while True:
+        with lock:
+            skipped = len(queue) if not totals['in_flight'] and not any(t.is_alive() for t in threads) else 0
+            finished = totals['graded'] + skipped >= expected and not totals['in_flight']
+        if finished:
+            break
+        time.sleep(1)
 
     print(
         f'{totals["graded"]} submissions graded in {time.monotonic() - started:.0f}s on {len(judges)} judge(s), '
-        f'{totals["failures"]} failed',
+        f'{totals["failures"]} failed, {totals["dropped"]} dropped, {len(reconnected)} reconnected',
         flush=True,
     )
+    if drop_after and not reconnected:
+        print('FAIL: the dropped judge never reconnected', flush=True)
+        totals['failures'] += 1
     for _, conn, _ in judges:
-        conn.send({'name': 'disconnect'})
+        try:
+            conn.send({'name': 'disconnect'})
+        except OSError:
+            pass
+    if drop_after:
+        print(f'graded on the reconnected judge: {totals["graded"]}', flush=True)
     sys.exit(1 if totals['failures'] else 0)
 
 

@@ -240,7 +240,12 @@ class Judge:
                 colored_aux_codes,
             )
         case_padding = '  ' if batch_number is not None else ''
-        report(ansi_style('%sTest case %2d %-3s %s' % (case_padding, case_number, colored_codes[0], case_info)))
+        report(
+            ansi_style(
+                '%sTest case %2d %-3s %s #%s'
+                % (case_padding, case_number, colored_codes[0], case_info, self.current_submission.id)
+            )
+        )
         self.packet_manager.test_case_status_packet(case_number, result)
         self.case_verdicts[codes[0]] += 1
 
@@ -695,6 +700,20 @@ def main():  # pragma: no cover
                 for i in range(first, first + count)
             ]
         vm_pool = VMPool(int(remote.max_concurrent_vms or 100))
+
+        def sweep_leftover_vms() -> None:
+            """Deletes this judge's VMs that no submission owns: deletions that failed (API rate limits) and crashes."""
+            from dmoj.remote.microvm_backend import SWEEP_INTERVAL
+
+            backend = make_backend(remote, env['id'])
+            while True:
+                time.sleep(SWEEP_INTERVAL)
+                try:
+                    backend.delete_orphans(keep=vm_pool.owned())
+                except Exception:
+                    logger.exception('Sweeping leftover VMs failed; will retry')
+
+        threading.Thread(target=sweep_leftover_vms, name='vm sweeper', daemon=True).start()
 
     judges = [
         ClassicJudge(

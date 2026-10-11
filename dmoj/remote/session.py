@@ -14,6 +14,7 @@ Grades one submission in disposable VMs while the judge only orchestrates.
 import logging
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Generator, List, Optional, TYPE_CHECKING, Tuple
 
@@ -36,6 +37,9 @@ REQUEST_MARGIN = 120  # seconds
 SETUP_TIMEOUT = 600  # seconds, for downloading the problem and compiling
 # How long grading may wait at the end for VM creations to notice they're cancelled: one API call with retries.
 CREATE_CANCEL_TIMEOUT = 120  # seconds
+# Responses from the platform's endpoint in front of a runner, not from the runner, retried this long after a VM starts.
+GATEWAY_STATUSES = (403, 502, 503, 504)
+GATEWAY_RETRY_SECONDS = 30
 
 
 class RemoteGradingError(Exception):
@@ -51,16 +55,23 @@ class Runner:
         self.headers = {**vm.headers, 'X-Runner-Token': vm.token}
 
     def call(self, path: str, timeout: float, json: Any = None, data: Optional[bytes] = None) -> Any:
-        response = self.http.post(
-            self.vm.url + path,
-            json=json,
-            data=data,
-            timeout=timeout,
-            headers=self.headers,
-        )
-        if response.status_code != 200:
+        deadline = time.monotonic() + GATEWAY_RETRY_SECONDS
+        while True:
+            response = self.http.post(
+                self.vm.url + path,
+                json=json,
+                data=data,
+                timeout=timeout,
+                headers=self.headers,
+            )
+            if response.status_code == 200:
+                return response.json()
+            # The runner itself answers 401/404/500. A 403 or 5xx comes from the platform's endpoint in front of it,
+            # seen briefly after a VM starts ("RBAC: access denied", bad gateway): retry for a while.
+            if response.status_code in GATEWAY_STATUSES and time.monotonic() < deadline:
+                time.sleep(1)
+                continue
             raise RemoteGradingError(f'runner {self.vm.id} {path} failed ({response.status_code}): {response.text}')
-        return response.json()
 
     def download_artifact(self) -> bytes:
         response = self.http.get(self.vm.url + '/artifact', timeout=SETUP_TIMEOUT, headers=self.headers)
@@ -110,6 +121,7 @@ class RemoteGradingSession:
             aborted = self._aborted.is_set()
             if not aborted:
                 self._vms.append(vm)
+                self.pool.own(vm.id)
         if aborted:
             # Grading ended right as this VM became ready; cleanup may already have run, so delete it here.
             self.backend.delete_vm(vm)
@@ -140,8 +152,13 @@ class RemoteGradingSession:
             vms, self._vms = self._vms, []
         if vms:
             with ThreadPoolExecutor(len(vms)) as executor:
-                list(executor.map(self.backend.delete_vm, vms))
+                list(executor.map(self._delete_vm, vms))
         self._release_slots(len(vms))
+
+    def _delete_vm(self, vm: VM) -> None:
+        # Disowned first: if deleting fails, the sweeper must see the VM as a leftover and retry it.
+        self.pool.disown(vm.id)
+        self.backend.delete_vm(vm)
 
     def _release_slots(self, count: int) -> None:
         with self._lock:

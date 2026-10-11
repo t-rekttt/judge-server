@@ -13,11 +13,12 @@ Every VM is tagged with the judge it belongs to, so a restarted judge deletes VM
 """
 
 import logging
+import random
 import re
 import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 import requests.adapters
@@ -30,6 +31,11 @@ RUNNER_TAG = 'dmoj-remote-runner'
 # Seconds to wait for a VM to reach `running` with an active endpoint, then for its runner to answer.
 DEFAULT_READY_TIMEOUT = 300
 API_ATTEMPTS = 5
+# Deleting is retried much longer: a VM that isn't deleted keeps costing money. With many judges in one process,
+# bursts of deletions run into the API's rate limit (HTTP 429) for a while.
+DELETE_ATTEMPTS = 30
+# How often the sweeper looks for VMs of this judge that no session owns anymore.
+SWEEP_INTERVAL = 180
 
 
 class MicroVMError(Exception):
@@ -73,26 +79,31 @@ class MicroVMBackend(VMBackend):
         self._http.mount('https://', adapter)
         self._http.mount('http://', adapter)
 
-    def _api(self, method: str, path: str, ok=(200, 201, 204), **kwargs) -> requests.Response:
+    def _api(
+        self, method: str, path: str, ok=(200, 201, 204), attempts: int = API_ATTEMPTS, **kwargs
+    ) -> requests.Response:
         """Calls the API, retrying rate limiting and server errors with backoff."""
         delay = 1.0
-        for attempt in range(1, API_ATTEMPTS + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 response = self._http.request(method, self.api_url + path, timeout=30, **kwargs)
             except requests.RequestException as error:
-                if attempt == API_ATTEMPTS:
+                if attempt == attempts:
                     raise MicroVMError(f'{method} {path} failed: {error}') from error
             else:
                 if response.status_code in ok:
                     return response
                 retryable = response.status_code == 429 or response.status_code >= 500
-                if not retryable or attempt == API_ATTEMPTS:
+                if not retryable or attempt == attempts:
                     raise MicroVMError(f'{method} {path} failed with {response.status_code}: {response.text[:500]}')
-                reset = response.headers.get('ratelimit-reset')
-                if response.status_code == 429 and reset and reset.isdigit():
-                    delay = max(delay, min(float(reset) - time.time(), 30.0))
+                if response.status_code == 429:
+                    # `ratelimit-reset` is a Unix timestamp; wait until then (plus jitter so a burst of callers
+                    # doesn't retry in the same instant), but never more than a minute.
+                    reset = response.headers.get('ratelimit-reset')
+                    until = float(reset) - time.time() if reset and reset.isdigit() else delay
+                    delay = max(delay, min(until, 60.0)) + random.uniform(0, 2)
             time.sleep(delay)
-            delay = min(delay * 2, 30.0)
+            delay = min(delay * 2, 60.0)
         raise AssertionError('unreachable')
 
     def _create_request(self, name: str) -> Dict[str, Any]:
@@ -162,25 +173,33 @@ class MicroVMBackend(VMBackend):
 
     def _delete(self, vm_id: str) -> None:
         try:
-            self._api('DELETE', f'/v2/microvms/{vm_id}', ok=(204, 404))
+            self._api('DELETE', f'/v2/microvms/{vm_id}', ok=(204, 404), attempts=DELETE_ATTEMPTS)
         except Exception:
-            logger.exception('Failed to delete MicroVM %s', vm_id)
+            # The sweeper will find it by tag and try again.
+            logger.exception('Failed to delete MicroVM %s; it will be swept later', vm_id)
 
     def delete_vm(self, vm: VM) -> None:
         self._delete(vm.id)
 
-    def delete_orphans(self) -> None:
-        orphans: List[str] = []
+    def list_vms(self) -> List[Dict[str, Any]]:
+        """Every VM carrying this judge's tag."""
+        vms: List[Dict[str, Any]] = []
         page = 1
         while True:
             data = self._api(
                 'GET', '/v2/microvms', params={'tag_name': self.judge_tag, 'per_page': 200, 'page': page}
             ).json()
-            orphans += [microvm['id'] for microvm in data.get('microvms') or []]
+            vms += data.get('microvms') or []
             if not (data.get('links') or {}).get('pages', {}).get('next'):
                 break
             page += 1
+        return vms
+
+    def delete_orphans(self, keep: Optional[Set[str]] = None) -> int:
+        """Deletes this judge's VMs except those in `keep` (ids of VMs sessions still own). Returns how many."""
+        orphans = [vm['id'] for vm in self.list_vms() if vm['id'] not in (keep or set())]
         if orphans:
-            logger.warning('Deleting %d MicroVMs left behind by a previous run of this judge', len(orphans))
+            logger.warning('Deleting %d MicroVMs of this judge that no submission owns', len(orphans))
         for vm_id in orphans:
             self._delete(vm_id)
+        return len(orphans)

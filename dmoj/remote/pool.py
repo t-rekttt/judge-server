@@ -15,7 +15,7 @@ Rules:
 import multiprocessing
 import threading
 import time
-from typing import Optional
+from typing import Optional, Set
 
 
 class VMPool:
@@ -23,6 +23,19 @@ class VMPool:
         self.capacity = capacity
         self._slots = multiprocessing.BoundedSemaphore(capacity)
         self._active = multiprocessing.Value('i', 0)
+        # Ids of VMs some submission owns right now, so a sweeper in the main process can tell this judge's leftover
+        # VMs (whose submission ended but whose deletion failed, e.g. under API rate limiting) from live ones.
+        self._manager = multiprocessing.Manager()
+        self._owned = self._manager.dict()
+
+    def own(self, vm_id: str) -> None:
+        self._owned[vm_id] = True
+
+    def disown(self, vm_id: str) -> None:
+        self._owned.pop(vm_id, None)
+
+    def owned(self) -> Set[str]:
+        return set(self._owned.keys())
 
     def register(self) -> None:
         """A submission starts grading."""

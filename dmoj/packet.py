@@ -1,7 +1,6 @@
 import errno
 import json
 import logging
-import os
 import socket
 import ssl
 import struct
@@ -10,7 +9,7 @@ import threading
 import time
 import traceback
 import zlib
-from typing import Dict, List, Optional, TYPE_CHECKING, Tuple
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING, Tuple
 
 from dmoj import sysinfo
 from dmoj.judgeenv import (
@@ -80,6 +79,10 @@ class PacketManager:
         self.cert_store = cert_store
 
         self._lock = threading.RLock()
+        # Serializes reconnections: a dead socket is noticed by both the reading thread and a sending thread.
+        self._reconnect_lock = threading.Lock()
+        # Connections known to be dead; sends on them return at once instead of blocking a reconnection.
+        self._dead: Set[Any] = set()
         self._batch = 0
         self._testcase_queue_lock = threading.Lock()
         self._testcase_queue: List[Tuple[int, Result]] = []
@@ -120,6 +123,7 @@ class PacketManager:
         self.handshake(problems, versions, self.name, self.key, storages, get_judge_version())
         log.info('Judge "%s" online: [%s]:%s', self.name, self.host, self.port)
         self.online = True
+        self.fallback = 4  # connected: the next outage starts the backoff over
 
     def _reconnect(self):
         self.online = False
@@ -156,32 +160,34 @@ class PacketManager:
         self._closed = True
 
     def _read_forever(self):
-        try:
-            while True:
+        while True:
+            try:
                 self._receive_packet(self._read_single())
-        except KeyboardInterrupt:
-            pass
-        except Exception:  # connection reset by peer
-            log.exception('Exception while reading packet from site, will not attempt to reconnect! Quitting judge.')
-            # TODO(tbrindus): this is really sad. This isn't equivalent to `raise SystemExit(1)` since we're not on the
-            # main thread, and doing the latter would only exit the network thread. We should fix mid-grading reconnects
-            # so that we don't need this sledgehammer approach that relies on Docker restarting the judge for us.
-            os._exit(1)
+            except KeyboardInterrupt:
+                return
+            except Exception:  # connection reset by peer
+                if self._closed:
+                    return
+                log.exception('Exception while reading packet from site: [%s]:%s', self.host, self.port)
+                self._connection_lost(self.conn)
 
     def _read_single(self) -> dict:
+        # Reconnection goes through `_connection_lost`, which serializes it with the sending threads: a dead socket is
+        # noticed by whichever thread touches it first, and only one of them must replace it.
+        conn = self.conn
         try:
             data = self.input.read(PacketManager.SIZE_PACK.size)
         except socket.error:
-            self._reconnect()
+            self._connection_lost(conn)
             return self._read_single()
         if not data:
-            self._reconnect()
+            self._connection_lost(conn)
             return self._read_single()
         size = PacketManager.SIZE_PACK.unpack(data)[0]
         try:
             packet = zlib.decompress(self.input.read(size))
         except zlib.error:
-            self._reconnect()
+            self._connection_lost(conn)
             return self._read_single()
         else:
             return json.loads(utf8text(packet))
@@ -248,12 +254,45 @@ class PacketManager:
 
         raw = zlib.compress(utf8bytes(json.dumps(packet)))
         with self._lock:
+            conn = self.conn
+            if conn is None or conn in self._dead:
+                # The connection is being replaced; the packet can't be delivered. Grading code keeps going and the
+                # site will time the submission out.
+                return
             try:
-                assert self.conn is not None
-                self.conn.sendall(PacketManager.SIZE_PACK.pack(len(raw)) + raw)
+                conn.sendall(PacketManager.SIZE_PACK.pack(len(raw)) + raw)
+                return
             except Exception:  # connection reset by peer
-                log.exception('Exception while sending packet to site, will not attempt to reconnect! Quitting judge.')
-                os._exit(1)
+                if self._closed:
+                    return
+                self._dead.add(conn)
+                log.exception('Exception while sending packet to site: [%s]:%s', self.host, self.port)
+        # Outside the send lock: reconnecting sleeps and handshakes, and must not block other threads' sends (they
+        # return at once on the dead connection instead). The packet is lost; if a submission is grading, the site
+        # will time it out and show an internal error for it. Reconnecting keeps this judge, and every other judge
+        # in this process, alive.
+        self._connection_lost(conn)
+
+    def _connection_lost(self, conn) -> None:
+        """
+        Drops whatever submission was grading (its results can't reach the site anymore) and reconnects, unless
+        another thread already replaced `conn`. Other judges sharing this process are unaffected.
+        """
+        with self._reconnect_lock:
+            if self.conn is not conn or self._closed:
+                return  # already reconnected (or shutting down)
+            with self._lock:
+                self._dead.add(conn)
+            with self._testcase_queue_lock:
+                self._testcase_queue.clear()
+            # Aborting waits for the grading worker, whose sends return at once now that the connection is marked
+            # dead; without that, the abort and the worker's next send would wait on each other.
+            self.judge.abort_grading()
+            self._reconnect()
+            with self._lock:
+                self._dead.discard(conn)
+        if self._closed:
+            raise ConnectionError('judge is shutting down')
 
     def _receive_packet(self, packet: dict):
         name = packet['name']
