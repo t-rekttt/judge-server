@@ -267,6 +267,10 @@ def make_handler(state: State):
 
         def delete(self, vm_id: str) -> None:
             with state.lock:
+                vm = state.vms.get(vm_id)
+                if vm is not None and time.monotonic() < vm['ready_at']:
+                    # DigitalOcean refuses to delete a VM that is still provisioning.
+                    return error(self, 400, 'FAILED_PRECONDITION', f'MicroVM {vm_id} is still provisioning')
                 vm = state.vms.pop(vm_id, None)
             if vm is None:
                 return error(self, 404, 'NOT_FOUND', 'MicroVM not found')

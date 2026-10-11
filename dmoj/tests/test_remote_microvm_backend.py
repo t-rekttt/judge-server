@@ -132,6 +132,18 @@ class MicroVMBackendTest(unittest.TestCase):
         backend = self.backend([FakeResponse(404, {'code': 'NOT_FOUND'})])
         backend._delete('vm-1')
 
+    def test_deleting_a_vm_still_provisioning_waits_for_it(self):
+        # A VM cancelled right after creation: the API refuses the deletion until it has started.
+        backend = self.backend(
+            [
+                FakeResponse(400, {'code': 'FAILED_PRECONDITION', 'message': 'MicroVM vm-1 is still provisioning'}),
+                FakeResponse(400, {'code': 'FAILED_PRECONDITION', 'message': 'MicroVM vm-1 is still provisioning'}),
+                FakeResponse(204),
+            ]
+        )
+        backend._delete('vm-1')
+        self.assertEqual(backend._http.request.call_count, 3)
+
     def test_orphans_are_listed_by_tag_across_pages(self):
         backend = self.backend(
             [

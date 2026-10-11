@@ -783,9 +783,11 @@ def main():  # pragma: no cover
             """Tops the parked VMs up to the reserve as submissions take them."""
             nonlocal standby_creating
             n = 0
-            while not stopping.is_set():
-                time.sleep(1)
+            while not stopping.wait(1):
                 with standby_lock:
+                    if stopping.is_set():
+                        # Shutdown just reaped the parked VMs: that deficit must not be filled.
+                        return
                     deficit = reserve - vm_pool.warm_count() - standby_creating
                     for _ in range(deficit):
                         if not vm_pool.acquire_standby():

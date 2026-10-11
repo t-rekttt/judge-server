@@ -160,7 +160,8 @@ tested when it was built.
 - **Talking to a VM:** requests to its endpoint (`https://<id>.<region>.microvm.ondigitalocean.com`) carry the
   DigitalOcean token in `Authorization`. The runner's own token goes in `X-Runner-Token`.
 - **API errors:** server errors and any 429 that still gets through are retried with backoff. Other errors fail the
-  VM.
+  VM. Deleting a VM that is still provisioning is refused (400 `FAILED_PRECONDITION`); deletion keeps retrying for
+  up to 5 minutes, so a VM cancelled right after creation is still removed once it has started.
 - **Rate limit pacing** (`dmoj/remote/rate_limit.py`): the API allows 5,000 requests an hour and 250 a minute per
   token. Creating a VM costs one request plus a poll every 1-4 s until it runs, and deleting one costs one request,
   so a judge grading many submissions at once could spend the hour's budget in minutes and then have every call wait

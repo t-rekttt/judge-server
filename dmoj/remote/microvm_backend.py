@@ -39,6 +39,8 @@ POLL_MAX = 4.0
 # Deleting is retried much longer: a VM that isn't deleted keeps costing money. With many judges in one process,
 # bursts of deletions run into the API's rate limit (HTTP 429) for a while.
 DELETE_ATTEMPTS = 30
+# How long to keep trying to delete a VM that is still provisioning (a VM takes well under this to start).
+PROVISIONING_DELETE_WAIT = 300
 # How often the sweeper looks for VMs of this judge that no session owns anymore.
 SWEEP_INTERVAL = 180
 
@@ -183,11 +185,23 @@ class MicroVMBackend(VMBackend):
             microvm = self._api('GET', f'/v2/microvms/{vm_id}').json()['microvm']
 
     def _delete(self, vm_id: str) -> None:
-        try:
-            self._api('DELETE', f'/v2/microvms/{vm_id}', ok=(204, 404), attempts=DELETE_ATTEMPTS)
-        except Exception:
-            # The sweeper will find it by tag and try again.
-            logger.exception('Failed to delete MicroVM %s; it will be swept later', vm_id)
+        deadline = time.monotonic() + PROVISIONING_DELETE_WAIT
+        while True:
+            try:
+                self._api('DELETE', f'/v2/microvms/{vm_id}', ok=(204, 404), attempts=DELETE_ATTEMPTS)
+                return
+            except MicroVMError as error:
+                # A VM can't be deleted while it is still provisioning (400 FAILED_PRECONDITION): one cancelled
+                # right after creation has to finish starting first.
+                if 'FAILED_PRECONDITION' in str(error) and time.monotonic() < deadline:
+                    time.sleep(5)
+                    continue
+                # The sweeper will find it by tag and try again.
+                logger.exception('Failed to delete MicroVM %s; it will be swept later', vm_id)
+                return
+            except Exception:
+                logger.exception('Failed to delete MicroVM %s; it will be swept later', vm_id)
+                return
 
     def delete_vm(self, vm: VM) -> None:
         self._delete(vm.id)
