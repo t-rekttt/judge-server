@@ -35,11 +35,17 @@ The site shows the same machine load for every one of these judges, since they s
 5. **Reporting order.** The site assigns each case to the batch opened by the last `batch-begin`, so:
    - Batches are reported one at a time, in order.
    - Cases outside batches are reported as soon as their verdict is certain, possibly out of order.
-6. **Cleanup.** All VMs are deleted when grading ends, on abort and on errors. The final verdict (`grading-end` or a
-   compile error) is reported only after they are gone: the site hands the judge its next submission the moment it
-   hears the verdict, and the judge can neither take it nor answer the site's pings until the grading worker has
-   exited. Deleting VMs can take minutes under API rate limiting, and the site drops a judge that stays silent for
-   60 seconds, which killed whatever submission it had just been handed.
+6. **Cleanup.** When grading ends cleanly, every VM is reset (`POST /reset`: running program killed, problem files and
+   compiled programs deleted) and parked in the pool as a warm VM. On abort and on errors, VMs are deleted. The
+   final verdict (`grading-end` or a compile error) is reported only after this is done: the site hands the judge
+   its next submission the moment it hears the verdict, and the judge can neither take it nor answer the site's
+   pings until the grading worker has exited. Deleting VMs can take minutes under API rate limiting, and the site
+   drops a judge that stays silent for 60 seconds, which killed whatever submission it had just been handed.
+7. **Warm VMs.** The next submission, whatever its problem or user, takes parked VMs (newest first) before creating
+   any; a parked VM that no longer answers its health check is deleted and replaced. A parked VM keeps its pool slot
+   and stays in the ownership record, so the sweeper leaves it alone. A reaper thread in the main process deletes
+   VMs parked longer than `warm_idle_seconds` (default 10; `0` disables reuse), and all of them when the judge
+   stops. Parking skips the VM start-up and the gateway's warm-up, which were most of a short submission's time.
 
 Code: `dmoj/remote/`
 - `session.py`: the orchestrator.
@@ -90,6 +96,7 @@ remote:
   judge_first_index: 0
   max_concurrent_vms: 100 # VMs the whole process may run at once, shared by its judges
   max_vms: 0              # per-submission cap on VMs; 0 = none
+  warm_idle_seconds: 10   # keep a finished submission's VMs this long for the next one; 0 = delete at once
   backend: microvm        # or `docker` (local runner containers)
   microvm:
     api_token: dop_v1_... # scopes: microvm:create, microvm:read, microvm:delete, microvm:access

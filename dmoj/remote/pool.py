@@ -10,15 +10,21 @@ Rules:
 - Extra VMs are granted only within the submission's fair share, `capacity // active submissions`, so several
   submissions split the pool evenly instead of the first one taking everything. The share is re-evaluated on every
   request, so it grows as other submissions finish.
+- Warm VMs: a submission that finishes cleanly parks its VMs instead of deleting them, and the next submission takes
+  them (any problem, any user) instead of creating new ones. A parked VM keeps its slot. A reaper in the main process
+  deletes VMs parked longer than the idle timeout, since they cost money while idle.
 """
 
+import json
 import multiprocessing
 import threading
 import time
-from typing import Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 # Bytes per owned-VM id slot: DigitalOcean ids are 36-character UUIDs, Docker ids 64 hex characters.
 OWNED_SLOT = 64
+# Bytes per warm-VM record: a JSON `VM` (id, url, token and the platform's endpoint headers).
+WARM_SLOT = 1024
 
 
 class VMPool:
@@ -32,6 +38,11 @@ class VMPool:
         # inherited across the fork proved unreliable there, which let the sweeper delete VMs in use.
         self._owned = multiprocessing.Array('c', OWNED_SLOT * capacity)
         self._owned_lock = multiprocessing.Lock()
+        # Parked VMs, each with the time it was parked. Same shared memory as the ownership record, for the same
+        # reason; a parked VM stays in the ownership record until it is deleted.
+        self._warm = multiprocessing.Array('c', WARM_SLOT * capacity)
+        self._warm_since = multiprocessing.Array('d', capacity)
+        self._warm_lock = multiprocessing.Lock()
 
     def own(self, vm_id: str) -> None:
         key = vm_id.encode()[:OWNED_SLOT]
@@ -98,3 +109,53 @@ class VMPool:
 
     def release(self) -> None:
         self._slots.release()
+
+    # Warm VMs. Records are JSON so any backend's `VM` fits; a record's slot stays taken while it is parked.
+    def park(self, vm: Any) -> bool:
+        """Parks a VM for reuse, keeping its slot. Returns False if there is no room (the caller then deletes it)."""
+        record = json.dumps(vm._asdict()).encode()
+        if len(record) > WARM_SLOT:
+            return False
+        with self._warm_lock:
+            for i in range(self.capacity):
+                if not self._warm_record(i):
+                    self._warm[i * WARM_SLOT : i * WARM_SLOT + len(record)] = record
+                    self._warm_since[i] = time.monotonic()
+                    return True
+        return False
+
+    def take_warm(self) -> Optional[Dict[str, Any]]:
+        """The most recently parked VM, as `VM` fields, with its slot; None if there is none."""
+        with self._warm_lock:
+            newest = None
+            for i in range(self.capacity):
+                if self._warm_record(i) and (newest is None or self._warm_since[i] > self._warm_since[newest]):
+                    newest = i
+            if newest is None:
+                return None
+            record = self._warm_record(newest)
+            self._clear_warm(newest)
+        return json.loads(record)
+
+    def reap_warm(self, idle_seconds: float) -> List[Dict[str, Any]]:
+        """Removes VMs parked longer than `idle_seconds` (all of them if 0). The caller deletes them and releases
+        their slots."""
+        now = time.monotonic()
+        reaped = []
+        with self._warm_lock:
+            for i in range(self.capacity):
+                record = self._warm_record(i)
+                if record and now - self._warm_since[i] >= idle_seconds:
+                    reaped.append(json.loads(record))
+                    self._clear_warm(i)
+        return reaped
+
+    def warm_count(self) -> int:
+        with self._warm_lock:
+            return sum(1 for i in range(self.capacity) if self._warm_record(i))
+
+    def _warm_record(self, i: int) -> bytes:
+        return bytes(self._warm[i * WARM_SLOT : (i + 1) * WARM_SLOT]).rstrip(b'\0')
+
+    def _clear_warm(self, i: int) -> None:
+        self._warm[i * WARM_SLOT : (i + 1) * WARM_SLOT] = b'\0' * WARM_SLOT

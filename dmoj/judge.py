@@ -11,7 +11,7 @@ from enum import Enum
 from http.server import HTTPServer
 from itertools import groupby
 from operator import itemgetter
-from typing import Any, Callable, Dict, Generator, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Set, Tuple
 
 from dmoj import packet
 from dmoj.control import JudgeControlRequestHandler
@@ -719,6 +719,40 @@ def main():  # pragma: no cover
 
         threading.Thread(target=sweep_leftover_vms, name='vm sweeper', daemon=True).start()
 
+        from dmoj.remote.backend import VM
+        from dmoj.remote.session import DEFAULT_WARM_IDLE_SECONDS
+
+        warm_idle = remote.warm_idle_seconds
+        warm_idle = float(DEFAULT_WARM_IDLE_SECONDS if warm_idle is None else warm_idle)
+        warm_backend = make_backend(remote, env['id'])
+
+        def retire_warm_vm(record: dict) -> None:
+            vm = VM(**record)
+            warm_backend.delete_vm(vm)
+            vm_pool.disown(vm.id)
+            vm_pool.release()
+
+        def retire_warm_vms(idle: float) -> List[threading.Thread]:
+            threads = [
+                threading.Thread(target=retire_warm_vm, args=(record,), name='retire warm vm', daemon=True)
+                for record in vm_pool.reap_warm(idle)
+            ]
+            for thread in threads:
+                thread.start()
+            return threads
+
+        def reap_warm_vms() -> None:
+            """Deletes VMs parked between submissions for longer than the idle timeout: they cost money while idle."""
+            while True:
+                time.sleep(1)
+                try:
+                    retire_warm_vms(warm_idle)
+                except Exception:
+                    logger.exception('Deleting idle warm VMs failed; will retry')
+
+        if warm_idle > 0:
+            threading.Thread(target=reap_warm_vms, name='warm vm reaper', daemon=True).start()
+
     judges = [
         ClassicJudge(
             judgeenv.server_host,
@@ -775,6 +809,10 @@ def main():  # pragma: no cover
         finally:
             for each in judges:
                 each.murder()
+            if vm_pool is not None:
+                # Parked VMs would otherwise run until the next start of this judge sweeps them.
+                for thread in retire_warm_vms(0):
+                    thread.join()
             if api_server:
                 api_server.shutdown()
 

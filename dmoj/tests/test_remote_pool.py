@@ -86,3 +86,33 @@ class VMPoolTest(unittest.TestCase):
         self.assertEqual(pool.owned(), {'a', 'b'})
         pool.own('a')  # already recorded: no duplicate
         self.assertEqual(pool.owned(), {'a', 'b'})
+
+    def test_warm_vms_are_shared_with_forked_workers_and_reaped_by_age(self):
+        from dmoj.remote.backend import VM
+
+        pool = VMPool(2)
+        self.assertTrue(pool.acquire_first())
+        pool.own('vm-a')
+
+        def child():
+            pool.park(VM('vm-a', 'http://a', 'token', {'Authorization': 'Bearer x'}))
+
+        context = multiprocessing.get_context('fork')
+        process = context.Process(target=child)
+        process.start()
+        process.join(10)
+        self.assertEqual(pool.warm_count(), 1)
+        self.assertEqual(pool.reap_warm(3600), [])  # too young
+        taken = pool.take_warm()
+        self.assertEqual(VM(**taken), VM('vm-a', 'http://a', 'token', {'Authorization': 'Bearer x'}))
+        self.assertIsNone(pool.take_warm())
+        self.assertTrue(pool.park(VM(**taken)))
+        self.assertEqual([record['id'] for record in pool.reap_warm(0)], ['vm-a'])
+        self.assertEqual(pool.warm_count(), 0)
+
+    def test_parking_is_bounded_by_capacity(self):
+        from dmoj.remote.backend import VM
+
+        pool = VMPool(1)
+        self.assertTrue(pool.park(VM('a', 'u', 't')))
+        self.assertFalse(pool.park(VM('b', 'u', 't')))

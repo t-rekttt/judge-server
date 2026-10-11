@@ -12,6 +12,7 @@ import glob
 import io
 import os
 import re
+import shutil
 import tarfile
 import tempfile
 from typing import Optional
@@ -45,6 +46,19 @@ def pack() -> bytes:
         for entry in os.listdir(cache_dir):
             tar.add(os.path.join(cache_dir, entry), arcname=os.path.join('cache', entry), filter=_without_links)
     return buffer.getvalue()
+
+
+def clear() -> None:
+    """Deletes every compiled program and its index entry, so a VM reused for another submission compiles afresh."""
+    for index_file in _index_files():
+        os.remove(index_file)
+    cache_dir = env.compiled_binary_cache_dir
+    for entry in os.listdir(cache_dir):
+        path = os.path.join(cache_dir, entry)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
 
 
 def unpack(data: bytes) -> None:

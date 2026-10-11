@@ -51,8 +51,8 @@ PROBLEMS="${1:-.*}" docker compose up -d --quiet-pull
 status=$(docker wait "$(docker compose ps -aq site)")
 docker compose logs --no-color --no-log-prefix site
 
-# Every VM must be gone once grading is over (the judge deletes them as each submission ends).
-sleep 5
+# Every VM must be gone once grading is over: warm VMs are deleted at shutdown and after 10 idle seconds.
+sleep 15
 leaked=$(docker ps -q --filter "$runner_filter" | wc -l)
 echo "Runner VMs left after grading: $leaked"
 [ "$leaked" = 0 ] || status=1

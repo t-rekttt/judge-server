@@ -6,7 +6,9 @@ Grades one submission in disposable VMs while the judge only orchestrates.
 2. Other VMs start in parallel, download the problem and take the first VM's compiled programs, so they never compile.
 3. Every VM repeatedly takes the next case still worth grading. Results go through the `Emitter`, which reports them
    with the same verdicts and in an order the site handles.
-4. All VMs are deleted at the end, on abort and on errors.
+4. When grading ends cleanly, every VM is reset and parked in the pool for the next submission (any problem, any
+   user) to take instead of creating its own; the judge deletes VMs parked longer than `warm_idle_seconds`. On abort
+   and on errors the VMs are deleted.
 
 `run()` yields the same IPC messages as `JudgeWorker._grade_cases`, so the rest of the judge is unchanged.
 """
@@ -43,6 +45,13 @@ GATEWAY_STATUSES = (403, 502, 503, 504)
 GATEWAY_RETRY_SECONDS = 180
 # The longest a submission can take end to end, used to tell a VM in use from one left behind.
 MAX_SUBMISSION_SECONDS = 2 * SETUP_TIMEOUT + 3600
+# Warm VMs: how long a VM may sit parked between submissions before it is deleted. Parked VMs cost money, and a
+# submission arriving within a few seconds is the common case during a contest.
+DEFAULT_WARM_IDLE_SECONDS = 10
+# Resetting a VM for reuse: kills whatever runs, deletes problem files and compiled programs.
+RESET_TIMEOUT = 60
+# A warm VM must answer at once; one that doesn't is deleted rather than waited for.
+WARM_HEALTH_TIMEOUT = 5
 
 
 class RemoteGradingError(Exception):
@@ -57,8 +66,15 @@ class Runner:
         self.http = session
         self.headers = {**vm.headers, 'X-Runner-Token': vm.token}
 
-    def call(self, path: str, timeout: float, json: Any = None, data: Optional[bytes] = None) -> Any:
-        deadline = time.monotonic() + GATEWAY_RETRY_SECONDS
+    def call(
+        self,
+        path: str,
+        timeout: float,
+        json: Any = None,
+        data: Optional[bytes] = None,
+        retry_seconds: float = GATEWAY_RETRY_SECONDS,
+    ) -> Any:
+        deadline = time.monotonic() + retry_seconds
         while True:
             response = self.http.post(
                 self.vm.url + path,
@@ -75,6 +91,13 @@ class Runner:
                 time.sleep(1)
                 continue
             raise RemoteGradingError(f'runner {self.vm.id} {path} failed ({response.status_code}): {response.text}')
+
+    def healthy(self) -> bool:
+        try:
+            response = self.http.get(self.vm.url + '/health', timeout=WARM_HEALTH_TIMEOUT, headers=self.vm.headers)
+        except requests.RequestException:
+            return False
+        return response.status_code == 200
 
     def download_artifact(self) -> bytes:
         deadline = time.monotonic() + GATEWAY_RETRY_SECONDS
@@ -99,6 +122,8 @@ class RemoteGradingSession:
         # the submission's fair share. `max_vms` additionally caps one submission; 0 means no cap.
         self.pool = pool or VMPool(int(self.config.max_concurrent_vms or 100))
         self.max_vms = int(self.config.max_vms or 0) or self.pool.capacity
+        idle = self.config.warm_idle_seconds
+        self.warm_idle = float(DEFAULT_WARM_IDLE_SECONDS if idle is None else idle)
         wall_time = self.submission.time_limit * 3  # matches the default `wall_time_factor`
         self.grade_timeout = wall_time + REQUEST_MARGIN
 
@@ -139,30 +164,88 @@ class RemoteGradingSession:
         return Runner(vm, self._http)
 
     def _create_runner_with_slot(self, label: str, first: bool) -> Optional[Runner]:
-        """Takes a pool slot, then creates the VM. Returns None if no extra slot could be had before grading ended."""
-        if first:
-            if not self.pool.acquire_first(self._aborted):
-                raise RemoteGradingError('aborted')
-        else:
+        """
+        A runner in a warm VM if one is parked, else in a new VM on a fresh pool slot. The first runner waits for a
+        slot; an extra one is granted only within the fair share, and returns None if grading ends before then.
+        """
+        while True:
+            if not first:
+                with self._lock:
+                    held = self._slots
+                if held >= self.pool.fair_share():
+                    if self._aborted.wait(1.0):
+                        return None
+                    continue
+            warm = self.pool.take_warm() if self.warm_idle > 0 else None
+            if warm is not None:
+                runner = self._adopt(VM(**warm))
+                if runner is not None:
+                    return runner
+                continue  # the parked VM was dead and got deleted; look again
+            if first:
+                if not self.pool.acquire_first(self._aborted):
+                    raise RemoteGradingError('aborted')
+            elif not self.pool.acquire_extra(held):
+                if self._aborted.wait(1.0):
+                    return None
+                continue
             with self._lock:
-                held = self._slots
-            if not self.pool.wait_for_extra(held, self._aborted):
-                return None
-        with self._lock:
-            self._slots += 1
-        try:
-            return self._create_runner(label)
-        except BaseException:
-            self._release_slots(1)
-            raise
+                self._slots += 1
+            try:
+                return self._create_runner(label)
+            except BaseException:
+                self._release_slots(1)
+                raise
 
-    def _cleanup(self) -> None:
+    def _adopt(self, vm: VM) -> Optional[Runner]:
+        """Takes over a parked VM, which already holds a slot and is in the ownership record."""
+        with self._lock:
+            aborted = self._aborted.is_set()
+            if not aborted:
+                self._vms.append(vm)
+                self._slots += 1
+        if aborted:
+            self._delete_vm(vm)
+            self.pool.release()
+            raise RemoteGradingError('aborted')
+        runner = Runner(vm, self._http)
+        if runner.healthy():
+            return runner
+        logger.warning('Parked VM %s no longer answers; deleting it', vm.id)
+        with self._lock:
+            self._vms.remove(vm)
+        self._delete_vm(vm)
+        self._release_slots(1)
+        return None
+
+    def _cleanup(self, park: bool = False) -> None:
+        """Lets go of every VM: parked for the next submission if `park` (and the VM resets cleanly), else deleted."""
         with self._lock:
             vms, self._vms = self._vms, []
         if vms:
             with ThreadPoolExecutor(len(vms)) as executor:
-                list(executor.map(self._delete_vm, vms))
-        self._release_slots(len(vms))
+                list(executor.map(self._park_vm if park and self.warm_idle > 0 else self._delete_and_release, vms))
+
+    def _delete_and_release(self, vm: VM) -> None:
+        self._delete_vm(vm)
+        self._release_slots(1)
+
+    def _park_vm(self, vm: VM) -> None:
+        runner = Runner(vm, self._http)
+        try:
+            # A worker may still be grading a case nobody needs: kill it, then wipe the VM for the next submission.
+            runner.call('/abort', RESET_TIMEOUT, retry_seconds=0)
+            runner.call('/reset', RESET_TIMEOUT, retry_seconds=0)
+        except Exception as error:
+            logger.warning('VM %s could not be reset for reuse, deleting it: %s', vm.id, error)
+            self._delete_and_release(vm)
+            return
+        if self.pool.park(vm):
+            # The slot now belongs to the parked VM: the reaper releases it when the VM is deleted.
+            with self._lock:
+                self._slots -= 1
+        else:
+            self._delete_and_release(vm)
 
     def _delete_vm(self, vm: VM) -> None:
         # Disowned first: if deleting fails, the sweeper must see the VM as a leftover and retry it.
@@ -222,7 +305,7 @@ class RemoteGradingSession:
                     # can neither take it nor answer the site's pings until this worker has exited. VM deletion can
                     # take minutes under API rate limiting, and the site drops a judge silent for 60 seconds, so
                     # tear down first and report after.
-                    self._teardown()
+                    self._teardown(park=True)
                 yield message
         except Exception:
             aborted = self._aborted.is_set()
@@ -235,10 +318,13 @@ class RemoteGradingSession:
             self._teardown()
             self.pool.unregister()
 
-    def _teardown(self) -> None:
-        """Stops workers grading cases nobody needs anymore and deletes every VM. Safe to call more than once."""
+    def _teardown(self, park: bool = False) -> None:
+        """
+        Stops workers grading cases nobody needs anymore and lets go of every VM: parked for reuse after a clean end,
+        deleted otherwise. Safe to call more than once.
+        """
         self._aborted.set()
-        self._cleanup()
+        self._cleanup(park)
         # Workers still creating a VM must finish first: this runs in a forked worker process that exits right after,
         # which would kill them before they record (and so delete) their VM. Creation checks `_aborted`, so they stop
         # promptly.

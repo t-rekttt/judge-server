@@ -11,6 +11,8 @@ The orchestrating judge drives it over HTTP, one submission per VM:
     POST /grade     {position, problem: urls}     grade one case, reading only its data from the test archive;
                                                   returns its result. URLs are re-sent so they never expire mid-grading
     POST /abort     {}                            kill whatever is running
+    POST /reset     {}                            forget the submission and delete its files, so the VM can grade
+                                                  another one (warm reuse)
     GET  /health                                  readiness probe
 
 Every request except /health must carry `X-Runner-Token: $RUNNER_TOKEN`. (`Authorization` is left to the platform:
@@ -20,6 +22,7 @@ graded exactly as a local judge grades it.
 """
 
 import argparse
+import gc
 import hmac
 import json
 import logging
@@ -160,6 +163,22 @@ class RunnerState:
         if self.grader is not None:
             self.grader.abort_grading()
 
+    def reset(self) -> None:
+        """Back to the state of a fresh VM: no submission, no problem files, no compiled programs."""
+        self.abort()
+        if self.archive_file is not None:
+            self.archive_file.close()
+        self.submission = self.problem = self.grader = None
+        self.cases = {}
+        self.archive_file = self.archive_name = None
+        self.urls = {}
+        # Executors delete their directories when collected; do that before the directories go, not after.
+        gc.collect()
+        artifact.clear()
+        for entry in os.listdir(PROBLEMS_ROOT):
+            shutil.rmtree(os.path.join(PROBLEMS_ROOT, entry), ignore_errors=True)
+        judgeenv._storage_namespace_cache[None].problem_root_cache.clear()
+
     def run_on_main_thread(self, work: Callable[[], Any]) -> Any:
         reply: queue.Queue = queue.Queue(1)
         self._work.put((work, reply))
@@ -266,11 +285,16 @@ class RunnerHandler(BaseHTTPRequestHandler):
                 state.refresh_urls(request.get('problem'))
                 return state.grade(int(request['position']))
 
+            def reset() -> dict:
+                state.reset()
+                return {'ok': True}
+
             routes: Dict[str, Callable[[], dict]] = {
                 '/prepare': prepare,
                 '/compile': compile,
                 '/artifact': unpack_artifact,
                 '/grade': grade,
+                '/reset': reset,
             }
             work = routes.get(self.path)
             if work is None:
