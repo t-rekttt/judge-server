@@ -578,9 +578,11 @@ class JudgeWorker:
 
 
 class ClassicJudge(Judge):
-    def __init__(self, host, port, name: Optional[str] = None, vm_pool: Any = None, **kwargs) -> None:
+    def __init__(
+        self, host, port, name: Optional[str] = None, key: Optional[str] = None, vm_pool: Any = None, **kwargs
+    ) -> None:
         super().__init__(
-            packet.PacketManager(host, port, self, name or env['id'], env['key'], **kwargs), vm_pool=vm_pool
+            packet.PacketManager(host, port, self, name or env['id'], key or env['key'], **kwargs), vm_pool=vm_pool
         )
 
 
@@ -673,27 +675,39 @@ def main():  # pragma: no cover
 
     # With remote grading, one process can present itself as several judges, each holding its own connection to the
     # site and grading its own submission, all drawing VMs from one shared pool.
-    judge_names = [env['id']]
+    identities = [(env['id'], env['key'])]
     vm_pool = None
     if judgeenv.env.remote_grading:
         from dmoj.remote.pool import VMPool
 
-        count = int(judgeenv.env.remote.judge_count or 1)
+        remote = judgeenv.env.remote
+        count = int(remote.judge_count or 1)
         if count > 1:
-            judge_names = [f'{env["id"]}-{i}' for i in range(1, count + 1)]
-        vm_pool = VMPool(int(judgeenv.env.remote.max_concurrent_vms or 100))
+            # Each judge's name and key come from patterns with `{i}` (its index), `{id}` and `{key}`.
+            name_format = remote.judge_name_format or '{id}-{i}'
+            key_format = remote.judge_key_format or '{key}'
+            first = int(remote.judge_first_index or 0)
+            identities = [
+                (
+                    name_format.format(i=i, id=env['id'], key=env['key']),
+                    key_format.format(i=i, id=env['id'], key=env['key']),
+                )
+                for i in range(first, first + count)
+            ]
+        vm_pool = VMPool(int(remote.max_concurrent_vms or 100))
 
     judges = [
         ClassicJudge(
             judgeenv.server_host,
             judgeenv.server_port,
             name=name,
+            key=key,
             vm_pool=vm_pool,
             secure=judgeenv.secure,
             no_cert_check=judgeenv.no_cert_check,
             cert_store=judgeenv.cert_store,
         )
-        for name in judge_names
+        for name, key in identities
     ]
     judge = judges[0]
 

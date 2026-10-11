@@ -64,8 +64,9 @@ env: ConfigNode = ConfigNode(
         # Cache submissions like auxiliary programs, so their compiled form can be reused (remote grading runners)
         'cache_all_compiled_binaries': False,
         # Grade in disposable VMs instead of locally; see docs/remote-grading.md for the `remote` settings.
-        # `remote.judge_count` makes this process present itself as that many judges (`<id>-1`, `<id>-2`, ...) to
-        # grade that many submissions at once, all sharing `remote.max_concurrent_vms` VMs.
+        # `remote.judge_count` makes this process present itself as that many judges to grade that many submissions
+        # at once, all sharing `remote.max_concurrent_vms` VMs. Their names and keys come from
+        # `remote.judge_name_format` / `remote.judge_key_format` (`{i}` = index from `remote.judge_first_index`).
         'remote_grading': False,
         'remote': {},
     },

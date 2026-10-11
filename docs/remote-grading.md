@@ -7,9 +7,11 @@ reports results to the site as usual. The site needs no changes.
 ## One process, several judges
 
 The site hands each judge one submission at a time. To grade several submissions at once without changing the site, one
-orchestrator process presents itself as `judge_count` judges, named `<id>-1` … `<id>-N`, all with the judge's key.
-Register those N names (same key) on the site. Each one holds its own connection and grades its own submission; they
-all draw VMs from one pool of `max_concurrent_vms`:
+orchestrator process presents itself as `judge_count` judges. Their names and keys follow `judge_name_format` and
+`judge_key_format`, where `{i}` is the judge's index (from `judge_first_index`, default 0), `{id}` the configured
+id and `{key}` the configured key; the defaults are `{id}-{i}` and `{key}`. Register those names and keys on the site.
+Each judge holds its own connection and grades its own submission; they all draw VMs from one pool of
+`max_concurrent_vms`:
 
 - A submission's first VM is always granted (it waits for a free slot if the pool is full), so it can at least
   compile and start.
@@ -78,7 +80,10 @@ The judge still needs `problem_storage_globs` (or `judge_version: 2` storages) t
 ```yaml
 remote_grading: true
 remote:
-  judge_count: 8          # present this process as 8 judges (`<id>-1` ... `<id>-8`), one submission each
+  judge_count: 8          # present this process as 8 judges, one submission each
+  judge_name_format: 'judge-{i}'            # judge-0 ... judge-7
+  judge_key_format: 'F2eo...{i}...57a'     # one key per judge, with its index inside
+  judge_first_index: 0
   max_concurrent_vms: 100 # VMs the whole process may run at once, shared by its judges
   max_vms: 0              # per-submission cap on VMs; 0 = none
   backend: microvm        # or `docker` (local runner containers)
