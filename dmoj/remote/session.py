@@ -216,25 +216,38 @@ class RemoteGradingSession:
 
         self.pool.register()
         try:
-            yield from self._run(IPC)
+            for message in self._run(IPC):
+                if message[0] in (IPC.GRADING_END, IPC.COMPILE_ERROR):
+                    # The site hands this judge its next submission the moment it hears the verdict, and the judge
+                    # can neither take it nor answer the site's pings until this worker has exited. VM deletion can
+                    # take minutes under API rate limiting, and the site drops a judge silent for 60 seconds, so
+                    # tear down first and report after.
+                    self._teardown()
+                yield message
         except Exception:
-            if self._aborted.is_set():
+            aborted = self._aborted.is_set()
+            self._teardown()
+            if aborted:
                 yield IPC.GRADING_ABORTED, ()
                 return
             raise
         finally:
-            # Stop workers grading cases nobody needs anymore, and delete every VM. Workers still creating a VM must
-            # finish first: this runs in a forked worker process that exits right after, which would kill them before
-            # they record (and so delete) their VM. Creation checks `_aborted`, so they stop promptly.
-            self._aborted.set()
-            self._cleanup()
-            with self._creating_done:
-                if not self._creating_done.wait_for(lambda: self._creating == 0, timeout=CREATE_CANCEL_TIMEOUT):
-                    logger.error(
-                        'VM creation did not stop within %d seconds; a VM may outlive grading', CREATE_CANCEL_TIMEOUT
-                    )
-            self._cleanup()
+            self._teardown()
             self.pool.unregister()
+
+    def _teardown(self) -> None:
+        """Stops workers grading cases nobody needs anymore and deletes every VM. Safe to call more than once."""
+        self._aborted.set()
+        self._cleanup()
+        # Workers still creating a VM must finish first: this runs in a forked worker process that exits right after,
+        # which would kill them before they record (and so delete) their VM. Creation checks `_aborted`, so they stop
+        # promptly.
+        with self._creating_done:
+            if not self._creating_done.wait_for(lambda: self._creating == 0, timeout=CREATE_CANCEL_TIMEOUT):
+                logger.error(
+                    'VM creation did not stop within %d seconds; a VM may outlive grading', CREATE_CANCEL_TIMEOUT
+                )
+        self._cleanup()
 
     def _run(self, IPC: Any) -> Generator[Tuple['IPC', tuple], None, None]:
         first = self._create_runner_with_slot('1', first=True)

@@ -35,7 +35,11 @@ The site shows the same machine load for every one of these judges, since they s
 5. **Reporting order.** The site assigns each case to the batch opened by the last `batch-begin`, so:
    - Batches are reported one at a time, in order.
    - Cases outside batches are reported as soon as their verdict is certain, possibly out of order.
-6. **Cleanup.** All VMs are deleted when grading ends, on abort and on errors.
+6. **Cleanup.** All VMs are deleted when grading ends, on abort and on errors. The final verdict (`grading-end` or a
+   compile error) is reported only after they are gone: the site hands the judge its next submission the moment it
+   hears the verdict, and the judge can neither take it nor answer the site's pings until the grading worker has
+   exited. Deleting VMs can take minutes under API rate limiting, and the site drops a judge that stays silent for
+   60 seconds, which killed whatever submission it had just been handed.
 
 Code: `dmoj/remote/`
 - `session.py`: the orchestrator.
@@ -140,6 +144,9 @@ tested when it was built.
 - **Talking to a VM:** requests to its endpoint (`https://<id>.<region>.microvm.ondigitalocean.com`) carry the
   DigitalOcean token in `Authorization`. The runner's own token goes in `X-Runner-Token`.
 - **API errors:** rate limiting (429) and server errors are retried with backoff. Other errors fail the VM.
+- **Rate limit budget:** the API allows 5,000 requests an hour and 250 a minute per token. Creating a VM costs one
+  request plus a poll every 1-4 s until it runs, and deleting one costs one request (more when retried), so a judge
+  grading many submissions at once spends the hourly budget fast; past it, every call waits for the reset.
 - **Tags:** every VM is tagged `dmoj-remote-runner` and `dmoj-judge-<judge id>`. At startup the judge deletes VMs with
   its own tag, left behind if it crashed mid-grading. Leaked VMs also pause after 10 idle minutes.
 

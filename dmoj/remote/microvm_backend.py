@@ -32,6 +32,9 @@ RUNNER_TAG = 'dmoj-remote-runner'
 # Seconds to wait for a VM to reach `running` with an active endpoint, then for its runner to answer.
 DEFAULT_READY_TIMEOUT = 300
 API_ATTEMPTS = 5
+# Polling a starting VM: first wait, then doubling up to the cap.
+POLL_INITIAL = 1.0
+POLL_MAX = 4.0
 # Deleting is retried much longer: a VM that isn't deleted keeps costing money. With many judges in one process,
 # bursts of deletions run into the API's rate limit (HTTP 429) for a while.
 DELETE_ATTEMPTS = 30
@@ -155,7 +158,9 @@ class MicroVMBackend(VMBackend):
         self, vm_id: str, microvm: Dict[str, Any], cancelled: Optional[threading.Event] = None
     ) -> str:
         deadline = time.monotonic() + self.ready_timeout
-        delay = 0.25
+        # Every poll counts against the API's rate limit (5,000 requests an hour, 250 a minute per token), which a
+        # busy judge creating VMs by the dozen exhausts quickly; a VM takes several seconds to start anyway.
+        delay = POLL_INITIAL
         while True:
             if cancelled is not None and cancelled.is_set():
                 raise CreationCancelled(f'creating MicroVM {vm_id} was cancelled')
@@ -169,7 +174,7 @@ class MicroVMBackend(VMBackend):
             if time.monotonic() > deadline:
                 raise MicroVMError(f'MicroVM {vm_id} not ready after {self.ready_timeout} seconds (state {state})')
             time.sleep(delay)
-            delay = min(delay * 2, 2.0)
+            delay = min(delay * 2, POLL_MAX)
             microvm = self._api('GET', f'/v2/microvms/{vm_id}').json()['microvm']
 
     def _delete(self, vm_id: str) -> None:

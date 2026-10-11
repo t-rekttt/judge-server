@@ -92,19 +92,26 @@ class RemoteSessionCleanupTest(unittest.TestCase):
             'dmoj.remote.session.list_problem_objects', return_value=[('init.yml', 10)]
         ):
             messages = []
+            alive_at_end = None
             if abort_after is not None:
                 threading.Timer(abort_after, session.abort).start()
             for name, _ in session.run():
                 messages.append(name.name if hasattr(name, 'name') else name)
-        return backend, messages
+                if messages[-1] == 'GRADING_END':
+                    alive_at_end = set(backend.alive)
+        return backend, messages, alive_at_end
 
     def test_vms_still_starting_when_grading_ends_are_deleted(self):
         # VM 1 grades all 8 cases long before VMs 2-4 are ready.
-        backend, messages = self.run_session()
+        backend, messages, alive_at_end = self.run_session()
         self.assertEqual(messages[-1], 'GRADING_END')
         self.assertEqual(backend.created, 4)
         self.assertEqual(backend.alive, set())
+        # The verdict is reported only once every VM is gone: the site gives this judge its next submission as soon
+        # as it hears it, and the judge can't take it (or answer pings) while the worker is still deleting VMs.
+        self.assertEqual(alive_at_end, set())
 
     def test_vms_still_starting_on_abort_are_deleted(self):
-        backend, messages = self.run_session(abort_after=0.05)
+        backend, messages, _ = self.run_session(abort_after=0.05)
+        self.assertEqual(messages[-1], 'GRADING_ABORTED')
         self.assertEqual(backend.alive, set())
