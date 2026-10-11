@@ -353,7 +353,7 @@ class RemoteGradingSession:
         first = self._create_runner_with_slot('1', first=True)
         assert first is not None
         self._prepare(first)
-        compiled = first.call('/compile', SETUP_TIMEOUT + self.grade_timeout, json={'grade_first': True})
+        compiled = first.call('/compile', SETUP_TIMEOUT)
         if 'compile_error' in compiled:
             yield IPC.COMPILE_ERROR, (compiled['compile_error'],)
             return
@@ -364,14 +364,11 @@ class RemoteGradingSession:
         yield IPC.GRADING_BEGIN, (manifest.pretested,)
 
         emitter = Emitter(manifest, self.submission.short_circuit)
-        emitter.add_result(emitter.unit_of[0], compiled['first_result'])
-        for name, args in emitter.drain():
-            yield getattr(IPC, name), args
-        if emitter.finished:
-            return
-
         events: 'queue.Queue[Tuple[str, Any]]' = queue.Queue()
         dispatcher = _Dispatcher(emitter)
+        # The other VMs start right after compilation, while the first grades its first case: a slow case 1 would
+        # otherwise hold every other VM back. They take the compiled programs from the first VM; a custom checker
+        # is only built on first use, so each VM builds its own copy (a small program, seconds at most).
         artifact = first.download_artifact()
         extra_vms = min(self.max_vms, len(emitter.units_in_order)) - 1
 

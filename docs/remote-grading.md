@@ -23,13 +23,15 @@ The site shows the same machine load for every one of these judges, since they s
 
 ## How a submission is graded
 
-1. **First VM:** downloads the problem's small files, compiles the submission and grades case 1.
+1. **First VM:** downloads the problem's small files and compiles the submission.
    - A compile error is reported right away, and no other VM is created.
-2. **Other VMs** (up to `max_vms` in total) start once compilation succeeds. They download the same small files and take the
-   first VM's compiled programs (submission, checkers, interactors, generators), so they don't compile again. This
-   works for every language: the executor cache restores the compiled directory, and executors that set run-time
-   state while writing their sources (Java, Python, Kotlin) write them again; Rust keeps a copy of its binary next
-   to its sources, since its build lands in a shared cargo target outside the cache.
+2. **Other VMs** (up to `max_vms` in total) start the moment compilation succeeds, while the first VM grades its
+   first case, so a slow case 1 holds nobody back. They download the same small files and take the first VM's
+   compiled programs (submission, interactors, generators), so they don't compile again. This works for every
+   language: the executor cache restores the compiled directory, and executors that set run-time state while
+   writing their sources (Java, Python, Kotlin) write them again; Rust keeps a copy of its binary next to its
+   sources, since its build lands in a shared cargo target outside the cache. A custom checker is built on first
+   use, so each VM builds its own copy; checkers are small, so that costs seconds at most.
 3. **Each VM** repeatedly takes the next case still worth grading.
    - Cases sharing an input/output pair are graded once, like the local result cache.
    - Cases already decided by short-circuiting are skipped.
@@ -63,6 +65,21 @@ Code: `dmoj/remote/`
 - `storage.py`: storage layout and presigned S3 URLs.
 - `range_file.py`: reads the test archive with HTTP range requests.
 - `backend.py`: VM creation.
+
+## Dropped site connections
+
+The site's bridge closes a judge's connection when it finds it silent for 60 seconds, when it is restarted, and
+when another judge connects under the same name. A judge whose connection drops mid-grading reconnects (with
+backoff) and keeps grading meanwhile: every packet about the submission since its acknowledgement is kept, and the
+whole sequence is sent again on the new connection before anything else, starting with a fresh `grading-begin`.
+The bridge treats that as the submission starting over, so it ends with all test cases stored.
+
+One site-side caveat: when the bridge loses a judge it marks the submission as an internal error and forgets it, and
+its handlers for the final packets (`grading-end`, `compile-error`, `internal-error`, `submission-terminated`)
+first remove the submission from the bridge's map with `del`, which raises for a submission it already forgot, so the
+final verdict is not written (the bridge logs `KeyError: <submission id>`). The test cases are stored; only the
+status stays at internal error. Changing that `del` in `judge_list.py`'s `on_judge_free` to a `pop(..., None)` lets
+the replayed verdict land. Until then, rejudging such a submission from the dashboard grades it normally.
 
 ## Problem storage
 

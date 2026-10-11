@@ -83,6 +83,11 @@ class PacketManager:
         self._reconnect_lock = threading.Lock()
         # Connections known to be dead; sends on them return at once instead of blocking a reconnection.
         self._dead: Set[Any] = set()
+        # Every packet sent about the submission being graded, from its acknowledgement on, so that after the site
+        # drops the connection mid-grading the whole sequence can be sent again on the new one: the site marked the
+        # submission as failed when it lost the judge, and a fresh `grading-begin` makes it start over. Grading
+        # itself carries on meanwhile; packets that find no connection wait here too. Guarded by `_lock`.
+        self._replay: List[dict] = []
         self._batch = 0
         self._testcase_queue_lock = threading.Lock()
         self._testcase_queue: List[Tuple[int, Result]] = []
@@ -254,15 +259,20 @@ class PacketManager:
                 # We cannot use utf8text because it may not be text.
                 packet[k] = v.decode('utf-8', 'replace')
 
-        raw = zlib.compress(utf8bytes(json.dumps(packet)))
         with self._lock:
+            if 'submission-id' in packet:
+                # Part of a submission's story: kept for a replay after a dropped connection. The first packet
+                # about a submission (its acknowledgement) starts a new story.
+                if packet['name'] == 'submission-acknowledged':
+                    self._replay = []
+                self._replay.append(packet)
             conn = self.conn
             if conn is None or conn in self._dead:
-                # The connection is being replaced; the packet can't be delivered. Grading code keeps going and the
-                # site will time the submission out.
+                # The connection is being replaced. The packet is in the replay log, if it belongs to a submission,
+                # and goes out with the rest once the judge is back online.
                 return
             try:
-                conn.sendall(PacketManager.SIZE_PACK.pack(len(raw)) + raw)
+                self._write(conn, packet)
                 return
             except Exception:  # connection reset by peer
                 if self._closed:
@@ -270,31 +280,55 @@ class PacketManager:
                 self._dead.add(conn)
                 log.exception('Exception while sending packet to site: [%s]:%s', self.host, self.port)
         # Outside the send lock: reconnecting sleeps and handshakes, and must not block other threads' sends (they
-        # return at once on the dead connection instead). The packet is lost; if a submission is grading, the site
-        # will time it out and show an internal error for it. Reconnecting keeps this judge, and every other judge
-        # in this process, alive.
+        # return at once on the dead connection instead). Reconnecting keeps this judge, and every other judge in
+        # this process, alive; the submission being graded is reported again on the new connection.
         self._connection_lost(conn)
+
+    def _write(self, conn, packet: dict) -> None:
+        raw = zlib.compress(utf8bytes(json.dumps(packet)))
+        conn.sendall(PacketManager.SIZE_PACK.pack(len(raw)) + raw)
 
     def _connection_lost(self, conn) -> None:
         """
-        Drops whatever submission was grading (its results can't reach the site anymore) and reconnects, unless
-        another thread already replaced `conn`. Other judges sharing this process are unaffected.
+        Reconnects, unless another thread already replaced `conn`, and tells the site the submission being graded
+        again from the start: the site gave it up when it lost the judge, and grading went on regardless. Other
+        judges sharing this process are unaffected.
         """
         with self._reconnect_lock:
             if self.conn is not conn or self._closed:
                 return  # already reconnected (or shutting down)
             with self._lock:
                 self._dead.add(conn)
-            with self._testcase_queue_lock:
-                self._testcase_queue.clear()
-            # The submission in flight is lost either way; stop its worker in the background. Waiting for it here
-            # (it can take up to a minute to exit) would hold up reconnecting and reading the site's next packets.
-            threading.Thread(target=self.judge.abort_grading, name='abort after disconnect', daemon=True).start()
             self._reconnect()
             with self._lock:
                 self._dead.discard(conn)
+                self._resend_submission()
         if self._closed:
             raise ConnectionError('judge is shutting down')
+
+    def _resend_submission(self) -> None:
+        """
+        Sends the current submission's packets again, on the connection just opened, before anything else goes
+        out on it. Called under `_lock`, so packets the grading thread produces meanwhile queue up behind it.
+        """
+        if not self._replay:
+            return
+        submission_id = self._replay[0].get('submission-id')
+        log.warning(
+            'Reporting submission %s again on the new connection (%d packets)', submission_id, len(self._replay)
+        )
+        conn = self.conn
+        try:
+            for packet in self._replay:
+                self._write(conn, packet)
+        except Exception:
+            # The new connection died too: the next reconnection replays the log again.
+            log.exception('Exception while replaying packets to site: [%s]:%s', self.host, self.port)
+            self._dead.add(conn)
+            return
+        if self._replay[-1]['name'] in ('grading-end', 'compile-error', 'internal-error', 'submission-terminated'):
+            # The story ended while the connection was down; it has now been told in full.
+            self._replay = []
 
     def _receive_packet(self, packet: dict):
         name = packet['name']
@@ -390,6 +424,7 @@ class PacketManager:
         log.debug('Compile error: %d', self.judge.current_submission.id)
         self.fallback = 4
         self._send_packet({'name': 'compile-error', 'submission-id': self.judge.current_submission.id, 'log': message})
+        self._submission_reported()
 
     def compile_message_packet(self, message: str):
         log.debug('Compile message: %d', self.judge.current_submission.id)
@@ -403,6 +438,7 @@ class PacketManager:
         self._send_packet(
             {'name': 'internal-error', 'submission-id': self.judge.current_submission.id, 'message': message}
         )
+        self._submission_reported()
 
     def begin_grading_packet(self, is_pretested: bool):
         log.debug('Begin grading: %d', self.judge.current_submission.id)
@@ -415,6 +451,16 @@ class PacketManager:
         self.fallback = 4
         self._flush_testcase_queue()
         self._send_packet({'name': 'grading-end', 'submission-id': self.judge.current_submission.id})
+        self._submission_reported()
+
+    def _submission_reported(self) -> None:
+        """
+        The submission's story is complete. If it reached the site, there is nothing to tell again; if the
+        connection is down, the whole story is kept for the reconnection, which tells it and then forgets it.
+        """
+        with self._lock:
+            if self.conn is not None and self.conn not in self._dead:
+                self._replay = []
 
     def batch_begin_packet(self):
         self._batch += 1
@@ -435,6 +481,7 @@ class PacketManager:
         log.debug('Submission aborted: %d', self.judge.current_submission.id)
         self._flush_testcase_queue()
         self._send_packet({'name': 'submission-terminated', 'submission-id': self.judge.current_submission.id})
+        self._submission_reported()
 
     def ping_packet(self, when: float):
         data = {'name': 'ping-response', 'when': when, 'time': time.time()}

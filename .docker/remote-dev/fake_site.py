@@ -127,20 +127,21 @@ def check(config: dict, stored: dict, outcome: str) -> list:
     return errors
 
 
-def grade(conn: Connection, sub_id: int, problem: str, config: dict, source: str):
-    conn.send(
-        {
-            'name': 'submission-request',
-            'submission-id': sub_id,
-            'problem-id': problem,
-            'language': config['language'],
-            'source': source,
-            'time-limit': config['time'],
-            'memory-limit': config['memory'],
-            'short-circuit': False,
-            'meta': config.get('meta', {}),
-        }
-    )
+def grade(conn: Connection, sub_id: int, problem: str, config: dict, source: str, send_request: bool = True):
+    if send_request:
+        conn.send(
+            {
+                'name': 'submission-request',
+                'submission-id': sub_id,
+                'problem-id': problem,
+                'language': config['language'],
+                'source': source,
+                'time-limit': config['time'],
+                'memory-limit': config['memory'],
+                'short-circuit': False,
+                'meta': config.get('meta', {}),
+            }
+        )
     stored: dict = {}
     batch_id, in_batch, batches, outcome, details = 0, False, [], 'graded', ''
     while True:
@@ -148,11 +149,14 @@ def grade(conn: Connection, sub_id: int, problem: str, config: dict, source: str
         name = packet['name']
         if name in (
             'submission-acknowledged',
-            'grading-begin',
             'compile-message',
             'supported-problems',
             'ping-response',
         ):
+            continue
+        if name == 'grading-begin':
+            # Told again from the start (after a dropped connection): forget what was stored before, as the site does.
+            stored, batch_id, in_batch, batches = {}, 0, False, []
             continue
         if name == 'batch-begin':
             batch_id += 1
@@ -226,17 +230,21 @@ def main() -> None:
     expected = len(queue)
 
     # DROP_JUDGE_AFTER=<seconds>: close the last judge's connection while it grades, as a site restart would. The
-    # judge must reconnect (counted below) and the others must keep grading; the dropped submission is requeued.
+    # judge must reconnect (counted below) and the others must keep grading. The judge reports the dropped
+    # submission again from the start on its new connection, so the reconnected loop first expects that replay and
+    # checks its verdict like any other.
     drop_after = float(os.environ.get('DROP_JUDGE_AFTER') or 0)
     reconnected: list = []
     dropped_once = threading.Event()
+
+    replayed: dict = {}  # submission id -> (problem, case, config, source) the dropped judge was grading
 
     def accept_reconnections() -> None:
         while True:
             for name, conn, executors in connect_judges(server, 1):
                 reconnected.append(name)
                 print(f'Judge {name} reconnected', flush=True)
-                threading.Thread(target=judge_loop, args=(name, conn, executors), daemon=True).start()
+                threading.Thread(target=judge_loop, args=(name, conn, executors, True), daemon=True).start()
 
     if drop_after:
         threading.Thread(target=accept_reconnections, daemon=True).start()
@@ -253,7 +261,41 @@ def main() -> None:
     for _, conn, _ in judges:
         threading.Thread(target=ping_forever, args=(conn,), daemon=True).start()
 
-    def judge_loop(name: str, conn: Connection, executors: set) -> None:
+    def judge_loop(name: str, conn: Connection, executors: set, expect_replay: bool = False) -> None:
+        if expect_replay:
+            # The first thing on a reconnected judge's connection is the dropped submission, told again.
+            with lock:
+                if not replayed:
+                    print(f'FAIL: {name} reconnected but no dropped submission awaits a replay', flush=True)
+                    totals['failures'] += 1
+                    return
+                sub_id, (problem, case, config, source) = next(iter(replayed.items()))
+                del replayed[sub_id]
+                totals['in_flight'] += 1
+            begin = time.monotonic()
+            try:
+                stored, outcome, details = grade(conn, sub_id, problem, config, source, send_request=False)
+            except (ConnectionError, OSError, ValueError, EOFError, zlib.error) as error:
+                with lock:
+                    totals['failures'] += 1
+                    totals['in_flight'] -= 1
+                print(
+                    f'FAIL: {name} reconnected but the replay of {problem}/{case} never completed: {error}', flush=True
+                )
+                return
+            errors = check(config, stored, outcome)
+            status = 'ok' if not errors else 'FAIL'
+            with lock:
+                totals['graded'] += 1
+                totals['in_flight'] -= 1
+                totals['failures'] += bool(errors)
+                print(
+                    f'[{status}] {problem}/{case} ({config["language"]}): {outcome}, {len(stored)} cases, '
+                    f'{time.monotonic() - begin:.1f}s after reconnect, REPLAYED [{name}]',
+                    flush=True,
+                )
+                for error in errors:
+                    print(f'    {error}', flush=True)
         while True:
             with lock:
                 index = next(
@@ -278,8 +320,10 @@ def main() -> None:
                 with lock:
                     totals['dropped'] += 1
                     totals['in_flight'] -= 1
-                    queue.insert(0, (sub_id, (problem, case, config, source)))
-                print(f'[dropped] {problem}/{case} on {name}: connection closed mid-grading, requeued', flush=True)
+                    replayed[sub_id] = (problem, case, config, source)
+                print(
+                    f'[dropped] {problem}/{case} on {name}: connection closed mid-grading, awaiting replay', flush=True
+                )
                 return
             errors = check(config, stored, outcome)
             times = sorted(case['time'] for case in stored.values() if case['status'] != 'SC')
@@ -303,8 +347,8 @@ def main() -> None:
     threads = [threading.Thread(target=judge_loop, args=judge, daemon=True) for judge in judges]
     for thread in threads:
         thread.start()
-    # Submissions requeued by a dropped judge are graded by its reconnected loop, so wait on the counts, not the
-    # original threads. A submission skipped by every judge (unsupported language) is never counted as graded.
+    # The submission a dropped judge was grading is reported again by its reconnected loop, so wait on the counts,
+    # not the original threads. A submission skipped by every judge (unsupported language) is never counted as graded.
     while True:
         with lock:
             skipped = len(queue) if not totals['in_flight'] and not any(t.is_alive() for t in threads) else 0
