@@ -159,10 +159,15 @@ tested when it was built.
   health check. If anything fails, the VM is deleted.
 - **Talking to a VM:** requests to its endpoint (`https://<id>.<region>.microvm.ondigitalocean.com`) carry the
   DigitalOcean token in `Authorization`. The runner's own token goes in `X-Runner-Token`.
-- **API errors:** rate limiting (429) and server errors are retried with backoff. Other errors fail the VM.
-- **Rate limit budget:** the API allows 5,000 requests an hour and 250 a minute per token. Creating a VM costs one
-  request plus a poll every 1-4 s until it runs, and deleting one costs one request (more when retried), so a judge
-  grading many submissions at once spends the hourly budget fast; past it, every call waits for the reset.
+- **API errors:** server errors and any 429 that still gets through are retried with backoff. Other errors fail the
+  VM.
+- **Rate limit pacing** (`dmoj/remote/rate_limit.py`): the API allows 5,000 requests an hour and 250 a minute per
+  token. Creating a VM costs one request plus a poll every 1-4 s until it runs, and deleting one costs one request,
+  so a judge grading many submissions at once could spend the hour's budget in minutes and then have every call wait
+  for the reset. Instead, every call first waits its turn in a limiter shared by the whole process and its grading
+  workers: the budget the API reports left (`ratelimit-remaining`, `ratelimit-reset`) is spread evenly over the time
+  left in the window, the minute limit caps bursts, and a floor of 200 requests is kept for the hour's end. A busy
+  judge therefore slows down VM creation smoothly rather than stopping dead.
 - **Tags:** every VM is tagged `dmoj-remote-runner` and `dmoj-judge-<judge id>`. At startup the judge deletes VMs with
   its own tag, left behind if it crashed mid-grading. Leaked VMs also pause after 10 idle minutes.
 

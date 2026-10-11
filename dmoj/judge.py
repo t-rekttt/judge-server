@@ -648,7 +648,10 @@ def main():  # pragma: no cover
     # languages the VMs support; run it with --skip-self-test, since the image's executors were tested when built.
     if judgeenv.env.remote_grading:
         from dmoj.remote.backend import make_backend
+        from dmoj.remote.rate_limit import shared_limiter
 
+        # Built before any worker is forked, so every caller of the VM API paces itself against the same budget.
+        shared_limiter()
         # VMs of submissions that were grading when this judge last stopped would otherwise run until auto-paused.
         make_backend(judgeenv.env.remote, env['id']).delete_orphans()
     elif not sanity_check():

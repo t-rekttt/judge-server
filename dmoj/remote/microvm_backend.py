@@ -25,6 +25,7 @@ import requests
 import requests.adapters
 
 from dmoj.remote.backend import CreationCancelled, VM, VMBackend, wait_until_healthy
+from dmoj.remote.rate_limit import shared_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ class MicroVMBackend(VMBackend):
 
         self._http = requests.Session()
         self._http.headers['Authorization'] = f'Bearer {self.api_token}'
+        # Paces every call under the token's rate limit; shared by all backends in the process and its workers.
+        self._limiter = shared_limiter()
         # Many VMs are created and polled at once; the default pool of 10 connections would be discarded and
         # reopened constantly.
         adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=64)
@@ -86,15 +89,17 @@ class MicroVMBackend(VMBackend):
     def _api(
         self, method: str, path: str, ok=(200, 201, 204), attempts: int = API_ATTEMPTS, **kwargs
     ) -> requests.Response:
-        """Calls the API, retrying rate limiting and server errors with backoff."""
+        """Calls the API at the rate limiter's pace, retrying rate limiting and server errors with backoff."""
         delay = 1.0
         for attempt in range(1, attempts + 1):
+            self._limiter.wait()
             try:
                 response = self._http.request(method, self.api_url + path, timeout=30, **kwargs)
             except requests.RequestException as error:
                 if attempt == attempts:
                     raise MicroVMError(f'{method} {path} failed: {error}') from error
             else:
+                self._limiter.update(response.headers)
                 if response.status_code in ok:
                     return response
                 retryable = response.status_code == 429 or response.status_code >= 500

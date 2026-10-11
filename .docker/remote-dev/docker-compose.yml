@@ -57,6 +57,9 @@ services:
     image: vnoj/judge-microvm:dev
     entrypoint: ['/env/bin/python3', '/remote-dev/fake_microvm_api.py', '8090', 'fake-do-token', 'dmoj-remote-dev',
                  'microvm-api']
+    environment:
+      # Requests per hour before the fake API answers 429, like DigitalOcean's 5,000; lower it to test pacing.
+      FAKE_API_HOURLY_LIMIT: ${FAKE_API_HOURLY_LIMIT:-5000}
     user: root
     volumes:
       - .:/remote-dev:ro

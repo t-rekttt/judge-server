@@ -15,6 +15,7 @@ Usage: python fake_microvm_api.py <port> <api token> <docker network> <host name
 """
 
 import json
+import os
 import socket
 import sys
 import threading
@@ -61,6 +62,32 @@ class State:
         self.vms: dict = {}
         self.checkpoints: dict = {}
         self.created = 0
+        # Rate limit like DigitalOcean's: a budget per hour window, reported in every response, 429 once spent.
+        # FAKE_API_HOURLY_LIMIT lowers it so a testsuite run exercises the judge's pacing.
+        self.hourly_limit = int(os.environ.get('FAKE_API_HOURLY_LIMIT') or 5000)
+        self.window_start = time.time()
+        self.used = 0
+        self.rejected = 0
+
+    def take_request(self) -> tuple:
+        """Counts one request; returns (allowed, headers)."""
+        with self.lock:
+            now = time.time()
+            if now >= self.window_start + 3600:
+                self.window_start, self.used = now, 0
+            allowed = self.used < self.hourly_limit
+            if allowed:
+                self.used += 1
+            else:
+                self.rejected += 1
+            headers = {
+                'ratelimit-limit': str(self.hourly_limit),
+                'ratelimit-remaining': str(max(0, self.hourly_limit - self.used)),
+                'ratelimit-reset': str(int(self.window_start + 3600)),
+            }
+            if not allowed:
+                headers['retry-after'] = str(int(self.window_start + 3600 - now))
+            return allowed, headers
 
 
 def error(handler, status: int, code: str, message: str) -> None:
@@ -77,7 +104,7 @@ def make_handler(state: State):
         def reply(self, status: int, body=None, raw: bytes = None, headers=None) -> None:
             data = raw if raw is not None else (json.dumps(body).encode() if body is not None else b'')
             self.send_response(status)
-            for key, value in (headers or {}).items():
+            for key, value in {**getattr(self, 'rate_headers', {}), **(headers or {})}.items():
                 self.send_header(key, value)
             if raw is None and body is not None:
                 self.send_header('Content-Type', 'application/json')
@@ -115,6 +142,9 @@ def make_handler(state: State):
                 return self.proxy(method, parts[1], '/' + '/'.join(parts[2:]), parsed.query)
             if parts[:2] != ['v2', 'microvms']:
                 return error(self, 404, 'NOT_FOUND', 'not found')
+            allowed, self.rate_headers = state.take_request()
+            if not allowed:
+                return error(self, 429, 'TOO_MANY_REQUESTS', 'API Rate limit exceeded.')
             rest = parts[2:]
             if method == 'POST' and not rest:
                 return self.create()
