@@ -1,0 +1,38 @@
+# Production orchestrating judge: one container presenting itself as several judges to the site and grading on
+# DigitalOcean MicroVMs. See docs/remote-grading.md, "Production deployment".
+#
+# Files next to this one:
+#   judge.yml   the judge configuration (copy judge.example.yml; holds credentials, keep it private)
+#   problems/   <problem>/init.yml for every problem the judges announce; filled by `docker compose run --rm problems`
+#   .env        DMOJ_SERVER_HOST (the site's bridge), optionally DMOJ_SERVER_PORT, JUDGE_IMAGE, DMOJ_JUDGE_ARGS
+services:
+  judge:
+    image: ${JUDGE_IMAGE:-registry.digitalocean.com/vnoj-judge/judge-microvm:latest}
+    # Orchestrating only: it never runs submissions, so it needs no ptrace or sandbox privileges.
+    entrypoint: ['/env/bin/dmoj', '-c', '/judge.yml', '--skip-self-test', '--no-watchdog']
+    # DMOJ_JUDGE_ARGS: e.g. "-s" for a TLS bridge (add --no-cert-check for a self-signed certificate).
+    command: -p ${DMOJ_SERVER_PORT:-9999} ${DMOJ_SERVER_HOST:?set DMOJ_SERVER_HOST to the site's bridge address} ${DMOJ_JUDGE_ARGS:-}
+    init: true
+    environment:
+      DMOJ_IN_DOCKER: '1'
+    volumes:
+      - ./judge.yml:/judge.yml:ro
+      - ./problems:/problems:ro
+    restart: unless-stopped
+    # On stop, the judge finishes aborting its submissions and deletes the VMs it keeps warm between submissions.
+    stop_grace_period: 3m
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: '5'
+
+  # One-off: downloads every problem's init.yml from storage into ./problems, so the judges can announce them.
+  # Run it again whenever problems are added:  docker compose run --rm problems
+  problems:
+    image: ${JUDGE_IMAGE:-registry.digitalocean.com/vnoj-judge/judge-microvm:latest}
+    profiles: [tools]
+    entrypoint: ['/env/bin/python3', '/judge/.docker/production/fetch_problem_inits.py', '-c', '/judge.yml', '/problems']
+    volumes:
+      - ./judge.yml:/judge.yml:ro
+      - ./problems:/problems

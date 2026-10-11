@@ -795,6 +795,14 @@ def main():  # pragma: no cover
     else:
         api_server = None
 
+    if judgeenv.env.remote_grading:
+        # `docker stop` sends SIGTERM: shut down like on Ctrl-C, so submissions are aborted and warm VMs deleted
+        # instead of running until the next start sweeps them.
+        def terminate(signum, frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, terminate)
+
     print()
     with monitor:
         try:

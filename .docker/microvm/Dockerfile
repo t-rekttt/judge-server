@@ -9,6 +9,7 @@ COPY --chown=root:root dmoj /judge/dmoj
 COPY .docker/microvm/entry /judge/.docker/microvm-entry
 COPY .docker/microvm/timing_benchmark.py .docker/microvm/compare_benchmarks.py .docker/microvm/create_checkpoint.py \
      /judge/.docker/microvm/
+COPY .docker/production/fetch_problem_inits.py /judge/.docker/production/
 # MicroVMs start the container as an arbitrary unprivileged uid (seen: 101, in group 0) instead of `judge` (1000).
 # - ~judge is mode 700: open it up (one directory, no copied layer). Everything under it is already world-readable,
 #   including the 1.5 GB Rust toolchain in ~/.rustup, which is only ever read.
