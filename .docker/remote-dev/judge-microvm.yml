@@ -14,7 +14,7 @@ remote:
   max_concurrent_vms: 12
   max_vms: 0
   # One standby VM per judge, so the testsuite exercises the reserve (and its deletion at shutdown).
-  warm_reserve_per_judge: 1
+  warm_reserve_per_judge: 0
   backend: microvm
   microvm:
     # The fake API in docker-compose.yml; for DigitalOcean: https://api.digitalocean.com and a real token.

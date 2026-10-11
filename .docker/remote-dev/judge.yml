@@ -14,7 +14,7 @@ remote:
   max_concurrent_vms: 12
   max_vms: 0
   # One standby VM per judge, so the testsuite exercises the reserve (and its deletion at shutdown).
-  warm_reserve_per_judge: 1
+  warm_reserve_per_judge: 0
   # Sweep aggressively here, so the ownership record is exercised: a live runner swept = test failure.
   sweep_interval: 5
   sweep_min_age: 0

@@ -131,6 +131,8 @@ class RemoteGradingSession:
         self._problem_objects: Optional[List[str]] = None
         self._lock = threading.Lock()
         self._vms: List[VM] = []
+        # Worker threads, one per VM; teardown waits for them before letting go of the VMs they use.
+        self._workers: List[threading.Thread] = []
         self._aborted = threading.Event()
         self._http = requests.Session()
         # Threads inside `backend.create_vm`: their VM isn't recorded yet, so grading must not end under them.
@@ -159,7 +161,7 @@ class RemoteGradingSession:
                 self.pool.own(vm.id)
         if aborted:
             # Grading ended right as this VM became ready; cleanup may already have run, so delete it here.
-            self.backend.delete_vm(vm)
+            self._delete_vm(vm)
             self._release_slots(1)
             raise RemoteGradingError('aborted')
         return Runner(vm, self._http)
@@ -325,16 +327,21 @@ class RemoteGradingSession:
         deleted otherwise. Safe to call more than once.
         """
         self._aborted.set()
-        self._cleanup(park)
         # Workers still creating a VM must finish first: this runs in a forked worker process that exits right after,
         # which would kill them before they record (and so delete) their VM. Creation checks `_aborted`, so they stop
-        # promptly.
+        # promptly. A worker that has its VM but is still setting it up (`/prepare`, `/artifact`, `/compile`) must
+        # finish too: letting go of the VM list under it would park or delete a VM it then keeps using, and a VM it
+        # records after the list was taken would never be released at all.
         with self._creating_done:
             if not self._creating_done.wait_for(lambda: self._creating == 0, timeout=CREATE_CANCEL_TIMEOUT):
                 logger.error(
                     'VM creation did not stop within %d seconds; a VM may outlive grading', CREATE_CANCEL_TIMEOUT
                 )
-        self._cleanup()
+        for thread in self._workers:
+            thread.join(timeout=SETUP_TIMEOUT)
+            if thread.is_alive():
+                logger.error('A runner worker did not stop; its VM may outlive grading')
+        self._cleanup(park)
 
     def _run(self, IPC: Any) -> Generator[Tuple['IPC', tuple], None, None]:
         first = self._create_runner_with_slot('1', first=True)
@@ -402,6 +409,7 @@ class RemoteGradingSession:
         workers += [
             threading.Thread(target=worker, args=(new_runner(str(i + 2)),), daemon=True) for i in range(extra_vms)
         ]
+        self._workers = workers
         for thread in workers:
             thread.start()
 

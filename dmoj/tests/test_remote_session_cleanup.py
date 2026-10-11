@@ -11,10 +11,11 @@ from dmoj.remote.session import RemoteGradingSession
 class SlowBackend(VMBackend):
     """VM 1 starts at once; later VMs take a while, like MicroVMs being provisioned. Records what is alive."""
 
-    def __init__(self) -> None:
+    def __init__(self, extra_delay: float = 5) -> None:
         self.lock = threading.Lock()
         self.alive: Set[str] = set()
         self.created = 0
+        self.extra_delay = extra_delay
 
     def create_vm(self, label, cancelled=None):
         with self.lock:
@@ -22,7 +23,7 @@ class SlowBackend(VMBackend):
             vm_id = f'vm-{self.created}'
             self.alive.add(vm_id)
         if not label.endswith('-1'):
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + self.extra_delay
             while time.monotonic() < deadline:
                 if cancelled is not None and cancelled.is_set():
                     self.delete_vm(VM(vm_id, '', ''))
@@ -55,7 +56,7 @@ def graded(points):
 
 
 class RemoteSessionCleanupTest(unittest.TestCase):
-    def run_session(self, abort_after=None, warm_idle=0, backend=None, pool=None, healthy=True):
+    def run_session(self, abort_after=None, warm_idle=0, backend=None, pool=None, healthy=True, setup_delay=0):
         backend = backend or SlowBackend()
         submission = mock.Mock(
             id=7,
@@ -73,6 +74,8 @@ class RemoteSessionCleanupTest(unittest.TestCase):
             session = RemoteGradingSession(submission, backend, pool)
 
         def call(runner, path, timeout, json=None, data=None, **kwargs):
+            if path in ('/prepare', '/artifact') and setup_delay:
+                time.sleep(setup_delay)  # an extra VM still being set up while VM 1 finishes everything
             if path == '/compile':
                 manifest = {
                     'pretested': False,
@@ -162,3 +165,19 @@ class RemoteSessionCleanupTest(unittest.TestCase):
         self.assertEqual(messages[-1], 'GRADING_END')
         self.assertEqual(backend.created, 4)
         self.assertNotIn('stale', pool.owned())
+
+    def test_vm_still_being_set_up_when_grading_ends_is_released(self):
+        # Extra VMs come up quickly but take a while to prepare; VM 1 grades every case before they are ready. The
+        # session must wait for those workers before letting go of the VMs, or a VM recorded after teardown took
+        # the list (or one still in use by its worker) is never parked or deleted.
+        from dmoj.remote.pool import VMPool
+
+        pool = VMPool(8)
+        backend, messages, alive_at_end, _ = self.run_session(
+            backend=SlowBackend(extra_delay=0.05), warm_idle=10, pool=pool, setup_delay=0.3
+        )
+        self.assertEqual(messages[-1], 'GRADING_END')
+        self.assertEqual(backend.created, 4)
+        # Every VM is accounted for: parked (reusable) or deleted, none forgotten.
+        self.assertEqual(len(backend.alive), pool.warm_count())
+        self.assertEqual(sorted(record['id'] for record in pool.reap_warm(0)), sorted(backend.alive))
