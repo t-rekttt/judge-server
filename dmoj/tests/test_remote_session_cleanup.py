@@ -83,7 +83,7 @@ class RemoteSessionCleanupTest(unittest.TestCase):
                     'cases': [case(i) for i in range(1, 9)],
                     'batch_dependencies': [],
                 }
-                return {'manifest': manifest, 'first_result': graded(1)}
+                return {'manifest': manifest}
             if path == '/grade':
                 time.sleep(0.02)
                 return graded(1)
@@ -225,3 +225,54 @@ class RemoteSessionCleanupTest(unittest.TestCase):
         # The slot it took is back in the pool: all 4 can be taken again.
         for _ in range(4):
             self.assertTrue(pool.acquire_extra(held=0))
+
+    def test_extra_vms_start_while_the_first_case_is_graded(self):
+        # Compilation done, the other VMs are asked for at once; they must not wait for case 1's result.
+        from dmoj.remote.pool import VMPool
+
+        created_before_first_grade = []
+        backend = SlowBackend(extra_delay=0)
+        original_grade = []
+
+        def call(runner, path, timeout, json=None, data=None, **kwargs):
+            if path == '/compile':
+                manifest = {
+                    'pretested': False,
+                    'warning': None,
+                    'cases': [case(i) for i in range(1, 9)],
+                    'batch_dependencies': [],
+                }
+                return {'manifest': manifest}
+            if path == '/grade':
+                if not original_grade:
+                    original_grade.append(True)
+                    time.sleep(0.3)  # a slow first case
+                    created_before_first_grade.append(backend.created)
+                return graded(1)
+            return {'ok': True}
+
+        submission = mock.Mock(
+            id=7,
+            problem_id='p',
+            storage_namespace=None,
+            language='CPP17',
+            source='',
+            time_limit=1.0,
+            memory_limit=65536,
+            short_circuit=False,
+            meta={},
+        )
+        config = mock.Mock(max_vms=4, max_concurrent_vms=8, warm_idle_seconds=0, storage=mock.Mock())
+        with mock.patch('dmoj.remote.session.env', mock.Mock(remote=config)):
+            session = RemoteGradingSession(submission, backend, VMPool(8))
+        with mock.patch('dmoj.remote.session.Runner.call', call), mock.patch(
+            'dmoj.remote.session.Runner.download_artifact', return_value=b''
+        ), mock.patch('dmoj.remote.session.Runner.healthy', return_value=True), mock.patch(
+            'dmoj.remote.session.problem_urls', return_value={}
+        ), mock.patch(
+            'dmoj.remote.session.list_problem_objects', return_value=[('init.yml', 10)]
+        ):
+            messages = [m[0].name for m in session.run()]
+        self.assertEqual(messages[-1], 'GRADING_END')
+        # All 4 VMs existed by the time the slow first case finished.
+        self.assertEqual(created_before_first_grade, [4])

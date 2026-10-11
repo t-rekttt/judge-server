@@ -4,8 +4,8 @@ Grading service that runs inside each VM: `python -m dmoj.remote.runner`.
 The orchestrating judge drives it over HTTP, one submission per VM:
 
     POST /prepare   {submission, problem: urls}   download the problem's files except zip archives, which stay remote
-    POST /compile   {grade_first}                 compile (a cache hit after POST /artifact); returns a compile error,
-                                                  or the case manifest, plus case 1's result if `grade_first`
+    POST /compile   {}                            compile (a cache hit after POST /artifact); returns a compile error
+                                                  or the case manifest
     GET  /artifact                                compiled programs, for other VMs of the same submission
     POST /artifact  <tar.gz>                      reuse compiled programs from the first VM
     POST /grade     {position, problem: urls}     grade one case, reading only its data from the test archive;
@@ -96,7 +96,7 @@ class RunnerState:
         self.urls = data['problem']
         _download_problem(self.submission.problem_id, self.urls)
 
-    def compile(self, grade_first: bool) -> dict:
+    def compile(self) -> dict:
         from dmoj.error import CompileError
         from dmoj.problem import Problem
 
@@ -123,13 +123,7 @@ class RunnerState:
             infos,
             [sorted(deps) for deps in batch_dependencies],
         )
-        reply: Dict[str, Any] = {'manifest': manifest.to_dict()}
-        if grade_first:
-            # Grading case 1 compiles what the grader only compiles on first use (custom checkers, generators), so
-            # the artifact other VMs fetch next carries those too. It is usually a sample, so it's fast, and it gives
-            # the orchestrator an early result to short-circuit on.
-            reply['first_result'] = self.grade(1)
-        return reply
+        return {'manifest': manifest.to_dict()}
 
     def open_remote_archive(self, problem_id: str, name: str) -> Optional[zipfile.ZipFile]:
         """Opens the problem's test archive from storage; members are fetched with range requests when read."""
@@ -274,7 +268,7 @@ class RunnerHandler(BaseHTTPRequestHandler):
                 return {'ok': True}
 
             def compile() -> dict:
-                return state.compile(bool(json.loads(body or b'{}').get('grade_first')))
+                return state.compile()
 
             def unpack_artifact() -> dict:
                 artifact.unpack(body)
