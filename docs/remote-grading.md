@@ -74,8 +74,8 @@ remote:
     # ...or from the image (slow: every VM boots and loads all languages).
     # image: registry.digitalocean.com/<team>/judge-microvm:<tag>
     # region: mkc1
-    # cpus: 2             # with memory_mb, one of 1/2048, 2/4096, 8/16384, 16/32768
-    # memory_mb: 4096
+    # cpus: 1             # with memory_mb, one of 1/2048, 2/4096, 8/16384, 16/32768
+    # memory_mb: 2048
     vpc_uuid: ...         # optional: keep VM traffic (S3 downloads) in a VPC
     ready_timeout: 300
   docker:                 # only for backend: docker
@@ -83,7 +83,7 @@ remote:
     network: dmoj-remote-dev
     user: 101             # MicroVMs run the image as an arbitrary uid in group 0
     memory_mb: 2048
-    cpus: 2               # see "Sizing" below
+    cpus: 2               # see "Sizing" below; real MicroVMs run fine on 1
   storage:
     endpoint: https://<region>.digitaloceanspaces.com
     bucket: problems
@@ -126,7 +126,7 @@ created from a checkpoint resumes with the runner already listening. To create o
 
 ```bash
 docker run --rm -e DIGITALOCEAN_TOKEN=... --entrypoint /env/bin/python3 <image> \
-  /judge/.docker/microvm/create_checkpoint.py <image> [--region mkc1 --cpus 2 --memory-mb 4096]
+  /judge/.docker/microvm/create_checkpoint.py <image> [--region mkc1 --cpus 1 --memory-mb 2048]
 ```
 
 It prints `checkpoint_id` and `checkpoint_runner_token` for the judge's configuration.
@@ -144,8 +144,11 @@ It prints `checkpoint_id` and `checkpoint_runner_token` for the judge's configur
   varied more (5–7% within a VM, worst run +43% over the median), which is normal for cache-sensitive code on shared
   hosts. The MicroVMs were about 1.8× faster than this development host, so time limits tuned for existing judges need
   measuring against the VMs before contests.
-- **Go needs about 18 CPU-seconds to build its standard library in a fresh VM.** On one vCPU that exceeds Go's 20 s
-  compile limit, so use 2 vCPUs (or pre-warm the Go build cache in the image).
+- **VM size: 1 vCPU / 2 GiB.** Go, the slowest compiler, builds its standard library from scratch in every fresh VM;
+  on a real 1-vCPU MicroVM that takes 9-13 s, within its 20 s compile limit. (On this slow development host it takes
+  ~18 CPU-seconds, which is why the local Docker runners get 2 CPUs.) Within the preview's 32 GiB account limit that
+  allows 16 VMs at once. The runner itself uses a few hundred MB, so submissions with memory limits near 2 GiB would
+  need the next size.
 
 ## Local test environment
 
@@ -173,7 +176,10 @@ name it `judge-real-*.yml`, which git ignores.
 - VM lifecycle, endpoint auth (`Authorization` is consumed by the endpoint, so the runner's token travels in
   `X-Runner-Token`), checkpoints, and orphan cleanup by tag: all verified against the real API.
 - From the registry image, a runner VM is ready in about 70 s; from a checkpoint, in a few seconds.
-- Account limits during the preview: 32 GiB of MicroVM memory in total (8 VMs of 4 GiB), 1000 VMs.
+- Account limits during the preview: 32 GiB of MicroVM memory in total (16 VMs of 2 GiB), 1000 VMs.
+- A checkpoint stores the VM's whole allocated disk plus RAM, not just what is used: 52 GiB for the 1 vCPU / 2 GiB
+  size (50 GB disk), 84 GiB for 2 vCPU / 4 GiB. At the documented $0.05/GiB-month that is a few dollars a month per
+  checkpoint; keep one, and recreate it after image changes.
 - Grading VNOI's real problems from the real bucket (`tas-problems/tests/`, Singapore) on MicroVMs started from a
   checkpoint in `mkc1`: 8 problems, 9 submissions covering AC, WA, TLE, a compile error and bridged checkers; every
   stored verdict was correct and no VM was left behind.

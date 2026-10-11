@@ -50,8 +50,9 @@ class MicroVMBackend(VMBackend):
         self.image: Optional[str] = config.image
         self.checkpoint_id: Optional[str] = config.checkpoint_id
         self.checkpoint_runner_token: Optional[str] = config.checkpoint_runner_token
-        self.cpus: int = int(config.cpus or 2)
-        self.memory_mb: int = int(config.memory_mb or 4096)
+        # Smallest size by default: Go, the slowest compiler, builds in 9-13 s on one vCPU of a real MicroVM.
+        self.cpus: int = int(config.cpus or 1)
+        self.memory_mb: int = int(config.memory_mb or 2048)
         self.vpc_uuid: Optional[str] = config.vpc_uuid
         # The local test environment points this at a fake API that serves runners over plain HTTP.
         self.endpoint_scheme: str = config.endpoint_scheme or 'https'

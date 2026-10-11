@@ -10,7 +10,7 @@ deletes it. Configure the printed checkpoint ID and runner token in the judge (`
 The runner token is baked into the checkpoint's environment, so every VM created from it shares that token. Keep it
 secret like the API token.
 
-Usage: python create_checkpoint.py <image> [--region mkc1] [--cpus 2] [--memory-mb 4096] [--api-url URL]
+Usage: python create_checkpoint.py <image> [--region mkc1] [--cpus 1] [--memory-mb 2048] [--api-url URL]
                                    [--endpoint-scheme https]
 The DigitalOcean token is read from DIGITALOCEAN_TOKEN (scopes: microvm:create, microvm:read, microvm:delete,
 microvm:access).
@@ -33,8 +33,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Creates the MicroVM checkpoint remote grading starts VMs from.')
     parser.add_argument('image')
     parser.add_argument('--region', default='mkc1')
-    parser.add_argument('--cpus', type=int, default=2)
-    parser.add_argument('--memory-mb', type=int, default=4096)
+    parser.add_argument('--cpus', type=int, default=1)
+    parser.add_argument('--memory-mb', type=int, default=2048)
     parser.add_argument('--api-url', default='https://api.digitalocean.com')
     parser.add_argument('--endpoint-scheme', default='https')
     args = parser.parse_args()

@@ -17,8 +17,8 @@ remote:
     endpoint_scheme: http
     region: mkc1
     image: vnoj/judge-microvm:dev
-    cpus: 2
-    memory_mb: 4096
+    cpus: 1
+    memory_mb: 2048
   storage:
     endpoint: http://s3:9000
     bucket: problems
