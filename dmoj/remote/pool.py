@@ -161,6 +161,11 @@ class VMPool:
         """A slot for a standby VM, if one is free right now; standby VMs never wait for a slot."""
         return self._slots.acquire(block=False)
 
+    def parked(self) -> List[Dict[str, Any]]:
+        """Every parked VM, as `VM` fields, without taking any."""
+        with self._warm_lock:
+            return [json.loads(self._warm_record(i)) for i in range(self.capacity) if self._warm_record(i)]
+
     def warm_count(self) -> int:
         with self._warm_lock:
             return sum(1 for i in range(self.capacity) if self._warm_record(i))

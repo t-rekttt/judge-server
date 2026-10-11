@@ -33,6 +33,8 @@ RUNNER_TAG = 'dmoj-remote-runner'
 # Seconds to wait for a VM to reach `running` with an active endpoint, then for its runner to answer.
 DEFAULT_READY_TIMEOUT = 300
 API_ATTEMPTS = 5
+# The longest idle time before the platform pauses a VM that this account's tier allows (4 hours).
+AUTO_PAUSE_IDLE_TIMEOUT = '4h'
 # Polling a starting VM: first wait, then doubling up to the cap.
 POLL_INITIAL = 1.0
 POLL_MAX = 4.0
@@ -121,8 +123,11 @@ class MicroVMBackend(VMBackend):
         request: Dict[str, Any] = {
             'name': name,
             'tags': [RUNNER_TAG, self.judge_tag],
-            # A VM is deleted when its submission is graded; pausing only matters for one that leaked.
-            'auto_pause': {'idle_timeout': '10m'},
+            # Standby VMs sit idle for as long as nobody submits. The platform pauses an idle VM (auto-pause can't
+            # be disabled, only delayed up to the account's maximum), and a paused one fails its health check when a
+            # submission finally takes it, so the submission waits for a new VM after all. The judge keeps parked
+            # VMs awake by pinging them well within this timeout; leaked VMs are the sweeper's job.
+            'auto_pause': {'idle_timeout': AUTO_PAUSE_IDLE_TIMEOUT},
         }
         if self.checkpoint_id:
             # Region, size, image and environment come from the checkpoint and may not be set.

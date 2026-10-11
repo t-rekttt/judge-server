@@ -111,6 +111,14 @@ class VMPoolTest(unittest.TestCase):
         self.assertEqual([record['id'] for record in pool.reap_warm(0)], ['vm-a'])
         self.assertEqual(pool.warm_count(), 0)
 
+    def test_parked_lists_without_taking(self):
+        from dmoj.remote.backend import VM
+
+        pool = VMPool(2)
+        pool.park(VM('a', 'u', 't'))
+        self.assertEqual([record['id'] for record in pool.parked()], ['a'])
+        self.assertEqual(pool.warm_count(), 1)
+
     def test_parking_is_bounded_by_capacity(self):
         from dmoj.remote.backend import VM
 

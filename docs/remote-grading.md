@@ -170,7 +170,11 @@ tested when it was built.
   left in the window, the minute limit caps bursts, and a floor of 200 requests is kept for the hour's end. A busy
   judge therefore slows down VM creation smoothly rather than stopping dead.
 - **Tags:** every VM is tagged `dmoj-remote-runner` and `dmoj-judge-<judge id>`. At startup the judge deletes VMs with
-  its own tag, left behind if it crashed mid-grading. Leaked VMs also pause after 10 idle minutes.
+  its own tag, left behind if it crashed mid-grading, and a sweeper does the same every few minutes while running.
+- **Auto-pause.** The platform pauses a VM that stays idle; this can't be disabled, only delayed up to the
+  account's maximum (4 hours on this tier), which is what VMs are created with. A paused VM fails its health check
+  when a submission takes it, which would cost that submission a VM start after all, so the judge pings every
+  parked VM every two minutes to keep it awake.
 
 **Checkpoints.** A VM created from the image boots the container and loads every language before it can grade. A VM
 created from a checkpoint resumes with the runner already listening. To create one:

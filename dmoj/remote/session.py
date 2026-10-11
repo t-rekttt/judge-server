@@ -50,8 +50,9 @@ MAX_SUBMISSION_SECONDS = 2 * SETUP_TIMEOUT + 3600
 DEFAULT_WARM_IDLE_SECONDS = 10
 # Resetting a VM for reuse: kills whatever runs, deletes problem files and compiled programs.
 RESET_TIMEOUT = 60
-# A warm VM must answer at once; one that doesn't is deleted rather than waited for.
-WARM_HEALTH_TIMEOUT = 5
+# A warm VM answers at once. One the platform paused for idleness resumes on the request, which takes a few seconds
+# more; one that doesn't answer within this is deleted rather than waited for.
+WARM_HEALTH_TIMEOUT = 20
 
 
 class RemoteGradingError(Exception):

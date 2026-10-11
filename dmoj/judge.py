@@ -722,8 +722,13 @@ def main():  # pragma: no cover
 
         threading.Thread(target=sweep_leftover_vms, name='vm sweeper', daemon=True).start()
 
+        import requests
+
         from dmoj.remote.backend import VM
         from dmoj.remote.session import DEFAULT_WARM_IDLE_SECONDS
+
+        # Parked VMs are pinged this often (seconds); far below the platform's auto-pause timeout.
+        KEEPALIVE_INTERVAL = 120
 
         warm_idle = remote.warm_idle_seconds
         warm_idle = float(DEFAULT_WARM_IDLE_SECONDS if warm_idle is None else warm_idle)
@@ -758,6 +763,19 @@ def main():  # pragma: no cover
                     retire_warm_vms(warm_idle, reserve)
                 except Exception:
                     logger.exception('Deleting idle warm VMs failed; will retry')
+
+        def keep_warm_vms_awake() -> None:
+            """
+            Pings parked VMs so the platform never sees them idle: it pauses a VM idle for longer than its
+            auto-pause timeout, and a paused VM fails its health check when a submission takes it.
+            """
+            while not stopping.wait(KEEPALIVE_INTERVAL):
+                for record in vm_pool.parked():
+                    vm = VM(**record)
+                    try:
+                        requests.get(vm.url + '/health', headers=vm.headers, timeout=10)
+                    except requests.RequestException:
+                        pass  # a dead VM is found and replaced when a submission takes it
 
         def create_standby_vm(label: str) -> None:
             nonlocal standby_creating
@@ -802,6 +820,7 @@ def main():  # pragma: no cover
             threading.Thread(target=reap_warm_vms, name='warm vm reaper', daemon=True).start()
         if reserve > 0:
             threading.Thread(target=keep_standby_vms, name='standby vms', daemon=True).start()
+            threading.Thread(target=keep_warm_vms_awake, name='warm vm keepalive', daemon=True).start()
 
     judges = [
         ClassicJudge(
