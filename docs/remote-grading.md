@@ -26,7 +26,10 @@ The site shows the same machine load for every one of these judges, since they s
 1. **First VM:** downloads the problem's small files, compiles the submission and grades case 1.
    - A compile error is reported right away, and no other VM is created.
 2. **Other VMs** (up to `max_vms` in total) start once compilation succeeds. They download the same small files and take the
-   first VM's compiled programs (submission, checkers, interactors, generators), so they don't compile again.
+   first VM's compiled programs (submission, checkers, interactors, generators), so they don't compile again. This
+   works for every language: the executor cache restores the compiled directory, and executors that set run-time
+   state while writing their sources (Java, Python, Kotlin) write them again; Rust keeps a copy of its binary next
+   to its sources, since its build lands in a shared cargo target outside the cache.
 3. **Each VM** repeatedly takes the next case still worth grading.
    - Cases sharing an input/output pair are graded once, like the local result cache.
    - Cases already decided by short-circuiting are skipped.
@@ -186,6 +189,26 @@ It prints `checkpoint_id` and `checkpoint_runner_token` for the judge's configur
   allows 16 VMs at once. The runner itself uses a few hundred MB, so submissions with memory limits near 2 GiB would
   need the next size.
 
+## Production deployment
+
+`.docker/production/` holds a Compose file for a plain Docker host (latest Docker with Compose v2):
+
+```bash
+mkdir judge && cd judge
+cp <repo>/.docker/production/{docker-compose.yml,judge.example.yml} .
+cp judge.example.yml judge.yml && chmod 600 judge.yml      # fill in credentials, judge names and keys
+echo DMOJ_SERVER_HOST=<site address> > .env                 # DMOJ_SERVER_PORT, DMOJ_JUDGE_ARGS (e.g. -s for TLS)
+docker compose run --rm problems                            # ./problems/<problem>/init.yml from storage
+docker compose up -d
+docker compose logs -f judge                                # one "online" line per judge
+```
+
+- The judges connect out to the site's bridge; nothing needs to reach the judge host.
+- `docker compose run --rm problems` again after adding problems to storage, then `docker compose restart judge`.
+- `docker compose down` aborts in-flight submissions (the site requeues them) and deletes the warm VMs.
+- Upgrading: build and push the image, recreate the checkpoint (its VMs run the image's runner), update
+  `checkpoint_id` and `checkpoint_runner_token`, then `docker compose pull && docker compose up -d`.
+
 ## Local test environment
 
 ```bash
@@ -230,5 +253,4 @@ name it `judge-real-*.yml`, which git ignores.
 
 ## Not done yet
 
-- Rust recompiles in each VM: its build output lives outside the shared cache.
 - Problems whose test data isn't in an archive are downloaded whole by every VM.
