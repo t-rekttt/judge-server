@@ -143,3 +143,11 @@ class VMPoolTest(unittest.TestCase):
         # Standby VMs never wait for a slot: the fourth slot is free, then the pool is full.
         self.assertTrue(pool.acquire_standby())
         self.assertFalse(pool.acquire_standby())
+
+    def test_over_release_is_logged_not_raised(self):
+        pool = VMPool(1)
+        with self.assertLogs('dmoj.remote.pool', level='ERROR'):
+            pool.release()
+        # The pool is still exactly its capacity.
+        self.assertTrue(pool.acquire_first())
+        self.assertFalse(pool.acquire_extra(held=0))

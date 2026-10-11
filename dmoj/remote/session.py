@@ -129,8 +129,12 @@ class RemoteGradingSession:
         self.grade_timeout = wall_time + REQUEST_MARGIN
 
         self._problem_objects: Optional[List[str]] = None
+        # Guards the VM record (`_vms`, `_closed`), the slot count and the creation count below.
         self._lock = threading.Lock()
         self._vms: List[VM] = []
+        # Set under the lock when cleanup takes the record: from then on nothing may be recorded, and whoever holds a
+        # VM that didn't make it in lets go of it. This, not timing, is what keeps every VM accounted for.
+        self._closed = False
         # Worker threads, one per VM; teardown waits for them before letting go of the VMs they use.
         self._workers: List[threading.Thread] = []
         self._aborted = threading.Event()
@@ -155,14 +159,14 @@ class RemoteGradingSession:
                 self._creating -= 1
                 self._creating_done.notify_all()
         with self._lock:
-            aborted = self._aborted.is_set()
-            if not aborted:
+            recorded = not self._closed
+            if recorded:
                 self._vms.append(vm)
                 self.pool.own(vm.id)
-        if aborted:
-            # Grading ended right as this VM became ready; cleanup may already have run, so delete it here.
+        if not recorded:
+            # Cleanup already took the record: nobody else will delete this VM. Its slot is released by the caller,
+            # like for any other failure in here.
             self._delete_vm(vm)
-            self._release_slots(1)
             raise RemoteGradingError('aborted')
         return Runner(vm, self._http)
 
@@ -203,11 +207,12 @@ class RemoteGradingSession:
     def _adopt(self, vm: VM) -> Optional[Runner]:
         """Takes over a parked VM, which already holds a slot and is in the ownership record."""
         with self._lock:
-            aborted = self._aborted.is_set()
-            if not aborted:
+            recorded = not self._closed
+            if recorded:
                 self._vms.append(vm)
                 self._slots += 1
-        if aborted:
+        if not recorded:
+            # Cleanup already took the record: the parked VM's slot is ours to give back, along with the VM.
             self._delete_vm(vm)
             self.pool.release()
             raise RemoteGradingError('aborted')
@@ -225,6 +230,7 @@ class RemoteGradingSession:
         """Lets go of every VM: parked for the next submission if `park` (and the VM resets cleanly), else deleted."""
         with self._lock:
             vms, self._vms = self._vms, []
+            self._closed = True
         if vms:
             with ThreadPoolExecutor(len(vms)) as executor:
                 list(executor.map(self._park_vm if park and self.warm_idle > 0 else self._delete_and_release, vms))

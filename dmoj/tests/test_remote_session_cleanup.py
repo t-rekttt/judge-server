@@ -181,3 +181,47 @@ class RemoteSessionCleanupTest(unittest.TestCase):
         # Every VM is accounted for: parked (reusable) or deleted, none forgotten.
         self.assertEqual(len(backend.alive), pool.warm_count())
         self.assertEqual(sorted(record['id'] for record in pool.reap_warm(0)), sorted(backend.alive))
+
+    def test_slots_balance_when_a_vm_becomes_ready_after_grading_ends(self):
+        # Extra VMs become ready right after VM 1 graded everything: they are deleted, and every pool slot comes back
+        # exactly once. A slot released twice over-releases the pool for the reaper to trip on later; one released
+        # never shrinks the pool for good.
+        from dmoj.remote.pool import VMPool
+
+        pool = VMPool(8)
+        backend, messages, _, session = self.run_session(backend=SlowBackend(extra_delay=0.15), pool=pool)
+        self.assertEqual(messages[-1], 'GRADING_END')
+        self.assertEqual(backend.alive, set())
+        self.assertEqual(session._slots, 0)
+        for _ in range(8):
+            self.assertTrue(pool.acquire_extra(held=0))
+        self.assertFalse(pool.acquire_extra(held=0))
+        for _ in range(8):
+            pool.release()
+        with self.assertLogs('dmoj.remote.pool', level='ERROR'):
+            pool.release()  # the pool is full again: no slot was released twice
+
+    def test_vm_recorded_after_cleanup_is_let_go(self):
+        # The record closes under the lock when cleanup takes it; a VM arriving afterwards is deleted by its creator
+        # and its slot returned, whatever the thread timing.
+        from dmoj.remote.pool import VMPool
+
+        pool = VMPool(4)
+        backend, messages, _, session = self.run_session(pool=pool)
+        self.assertTrue(session._closed)
+        # A creation that was already past the abort check when the record closed: the backend returns the VM.
+        session._aborted.clear()
+
+        def late_create(label, cancelled=None):
+            backend.alive.add('late')
+            return VM('late', 'http://late', 't')
+
+        with mock.patch.object(backend, 'create_vm', late_create):
+            with self.assertRaises(Exception):
+                session._create_runner_with_slot('9', first=True)
+        self.assertNotIn('late', backend.alive)
+        self.assertEqual(session._slots, 0)
+        self.assertNotIn('late', pool.owned())
+        # The slot it took is back in the pool: all 4 can be taken again.
+        for _ in range(4):
+            self.assertTrue(pool.acquire_extra(held=0))

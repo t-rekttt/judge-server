@@ -19,10 +19,13 @@ Rules:
 """
 
 import json
+import logging
 import multiprocessing
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 # Bytes per owned-VM id slot: DigitalOcean ids are 36-character UUIDs, Docker ids 64 hex characters.
 OWNED_SLOT = 64
@@ -111,7 +114,12 @@ class VMPool:
         return False
 
     def release(self) -> None:
-        self._slots.release()
+        """Gives a slot back. Giving back more than were taken is a bookkeeping bug elsewhere, which is logged and
+        otherwise ignored: a crashed reaper or session thread would cost VMs, a missing slot only capacity."""
+        try:
+            self._slots.release()
+        except ValueError:
+            logger.error('VM pool slot released that was never taken', stack_info=True)
 
     # Warm VMs. Records are JSON so any backend's `VM` fits; a record's slot stays taken while it is parked.
     def park(self, vm: Any) -> bool:

@@ -737,9 +737,13 @@ def main():  # pragma: no cover
 
         def retire_warm_vm(record: dict) -> None:
             vm = VM(**record)
-            warm_backend.delete_vm(vm)
-            vm_pool.disown(vm.id)
-            vm_pool.release()
+            try:
+                warm_backend.delete_vm(vm)  # never raises; a failed deletion is logged and left to the sweeper
+            finally:
+                # The record and the slot are given back whatever happened to the VM: the sweeper finds a VM that
+                # nobody owns and that stayed alive, while a slot kept forever would shrink the pool for good.
+                vm_pool.disown(vm.id)
+                vm_pool.release()
 
         # Standby reserve: parked VMs kept at all times, so a submission arriving at an idle judge starts at once.
         reserve = count * int(remote.warm_reserve_per_judge or 0) if warm_idle > 0 else 0
