@@ -18,6 +18,8 @@ cleanup() {
   docker ps -aq --filter "$runner_filter" | xargs -r docker rm -f >/dev/null || true
 }
 trap cleanup EXIT
+export JUDGE_COUNT=$(sed -n 's/^ *judge_count: *//p' "$config" | head -1)
+export JUDGE_COUNT=${JUDGE_COUNT:-1}
 PROBLEMS_DIR="$site_dir" JUDGE_CONFIG="$config" docker compose -f docker-compose.yml -f docker-compose.real.yml up -d --quiet-pull site judge
 status=$(docker wait "$(docker compose -f docker-compose.yml -f docker-compose.real.yml ps -aq site)")
 docker compose -f docker-compose.yml -f docker-compose.real.yml logs --no-color --no-log-prefix site

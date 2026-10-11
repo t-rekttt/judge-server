@@ -22,6 +22,7 @@ import requests
 from dmoj.judgeenv import env
 from dmoj.remote.backend import VM, VMBackend, make_backend
 from dmoj.remote.emitter import Emitter, UnitKey
+from dmoj.remote.pool import VMPool
 from dmoj.remote.protocol import Manifest
 from dmoj.remote.storage import list_problem_objects, problem_urls
 
@@ -68,11 +69,16 @@ class Runner:
 
 
 class RemoteGradingSession:
-    def __init__(self, submission: 'Submission', backend: Optional[VMBackend] = None) -> None:
+    def __init__(
+        self, submission: 'Submission', backend: Optional[VMBackend] = None, pool: Optional[VMPool] = None
+    ) -> None:
         self.submission = submission
         self.config = env.remote
         self.backend = backend or make_backend(self.config, env['id'])
-        self.max_vms = int(self.config.max_vms or 4)
+        # VMs for this submission come from the pool shared by every submission this process grades at once, within
+        # the submission's fair share. `max_vms` additionally caps one submission; 0 means no cap.
+        self.pool = pool or VMPool(int(self.config.max_concurrent_vms or 100))
+        self.max_vms = int(self.config.max_vms or 0) or self.pool.capacity
         wall_time = self.submission.time_limit * 3  # matches the default `wall_time_factor`
         self.grade_timeout = wall_time + REQUEST_MARGIN
 
@@ -84,6 +90,8 @@ class RemoteGradingSession:
         # Threads inside `backend.create_vm`: their VM isn't recorded yet, so grading must not end under them.
         self._creating = 0
         self._creating_done = threading.Condition(self._lock)
+        # Pool slots this submission holds, released as its VMs are deleted.
+        self._slots = 0
 
     # VM bookkeeping: every VM created is recorded before use, so `_cleanup` and `abort` can always delete it.
     def _create_runner(self, label: str) -> Runner:
@@ -105,15 +113,42 @@ class RemoteGradingSession:
         if aborted:
             # Grading ended right as this VM became ready; cleanup may already have run, so delete it here.
             self.backend.delete_vm(vm)
+            self._release_slots(1)
             raise RemoteGradingError('aborted')
         return Runner(vm, self._http)
+
+    def _create_runner_with_slot(self, label: str, first: bool) -> Optional[Runner]:
+        """Takes a pool slot, then creates the VM. Returns None if no extra slot could be had before grading ended."""
+        if first:
+            if not self.pool.acquire_first(self._aborted):
+                raise RemoteGradingError('aborted')
+        else:
+            with self._lock:
+                held = self._slots
+            if not self.pool.wait_for_extra(held, self._aborted):
+                return None
+        with self._lock:
+            self._slots += 1
+        try:
+            return self._create_runner(label)
+        except BaseException:
+            self._release_slots(1)
+            raise
 
     def _cleanup(self) -> None:
         with self._lock:
             vms, self._vms = self._vms, []
         if vms:
-            with ThreadPoolExecutor(len(vms)) as pool:
-                list(pool.map(self.backend.delete_vm, vms))
+            with ThreadPoolExecutor(len(vms)) as executor:
+                list(executor.map(self.backend.delete_vm, vms))
+        self._release_slots(len(vms))
+
+    def _release_slots(self, count: int) -> None:
+        with self._lock:
+            count = min(count, self._slots)
+            self._slots -= count
+        for _ in range(count):
+            self.pool.release()
 
     def abort(self) -> None:
         """Called from the IPC thread: stop everything. In-flight requests fail, and `run` then reports the abort."""
@@ -153,6 +188,7 @@ class RemoteGradingSession:
     def run(self) -> Generator[Tuple['IPC', tuple], None, None]:
         from dmoj.judge import IPC
 
+        self.pool.register()
         try:
             yield from self._run(IPC)
         except Exception:
@@ -172,9 +208,11 @@ class RemoteGradingSession:
                         'VM creation did not stop within %d seconds; a VM may outlive grading', CREATE_CANCEL_TIMEOUT
                     )
             self._cleanup()
+            self.pool.unregister()
 
     def _run(self, IPC: Any) -> Generator[Tuple['IPC', tuple], None, None]:
-        first = self._create_runner('1')
+        first = self._create_runner_with_slot('1', first=True)
+        assert first is not None
         self._prepare(first)
         compiled = first.call('/compile', SETUP_TIMEOUT + self.grade_timeout, json={'grade_first': True})
         if 'compile_error' in compiled:
@@ -198,10 +236,12 @@ class RemoteGradingSession:
         artifact = first.download_artifact()
         extra_vms = min(self.max_vms, len(emitter.units_in_order)) - 1
 
-        def worker(runner_factory: Callable[[], Runner]) -> None:
+        def worker(runner_factory: Callable[[], Optional[Runner]]) -> None:
             unit: Optional[UnitKey] = None
             try:
                 runner = runner_factory()
+                if runner is None:
+                    return  # grading ended before a slot for this extra VM was free
                 while not self._aborted.is_set():
                     unit = dispatcher.next_unit()
                     if unit is None:
@@ -219,9 +259,11 @@ class RemoteGradingSession:
             finally:
                 events.put(('done', None))
 
-        def new_runner(label: str) -> Callable[[], Runner]:
-            def factory() -> Runner:
-                runner = self._create_runner(label)
+        def new_runner(label: str) -> Callable[[], Optional[Runner]]:
+            def factory() -> Optional[Runner]:
+                runner = self._create_runner_with_slot(label, first=False)
+                if runner is None:
+                    return None
                 self._prepare(runner)
                 runner.call('/artifact', SETUP_TIMEOUT, data=artifact)
                 # Builds the grader; with the artifact in place, nothing is compiled again.
@@ -230,7 +272,7 @@ class RemoteGradingSession:
 
             return factory
 
-        workers = [threading.Thread(target=worker, args=(lambda: first,), daemon=True)]
+        workers = [threading.Thread(target=worker, args=(lambda: first,), daemon=True)]  # type: ignore[arg-type]
         workers += [
             threading.Thread(target=worker, args=(new_runner(str(i + 2)),), daemon=True) for i in range(extra_vms)
         ]

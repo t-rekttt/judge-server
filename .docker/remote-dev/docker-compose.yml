@@ -43,6 +43,7 @@ services:
     entrypoint: ['/env/bin/python3', '/remote-dev/fake_site.py', '/problems', '9999', '${PROBLEMS:-.*}']
     environment:
       ABORT_AFTER: ${ABORT_AFTER:-}
+      JUDGE_COUNT: ${JUDGE_COUNT:-1}
     volumes:
       - ${PROBLEMS_DIR:-../../testsuite}:/problems:ro
       - .:/remote-dev:ro

@@ -7,7 +7,8 @@ opened by the last `batch-begin`, and batches are numbered by counting `batch-be
 scores against each test's expectations and reports how long grading took.
 
 Usage: python fake_site.py <testsuite dir> [port] [problem regex]
-Exits non-zero if any submission's stored result doesn't match its expectations.
+With JUDGE_COUNT=<n>, it waits for that many judges and grades on all of them at once, one submission per judge at a
+time, like the site's bridge. Exits non-zero if any submission's stored result doesn't match its expectations.
 With ABORT_AFTER=<seconds>, it instead aborts the first submission after that long, like a user pressing "Abort", and
 exits non-zero unless the judge confirms the abort.
 """
@@ -162,60 +163,99 @@ def grade(conn: Connection, sub_id: int, problem: str, config: dict, source: str
             return stored, 'aborted', ''
 
 
+def connect_judges(server: socket.socket, expected: int) -> list:
+    """Accepts `expected` judge connections and completes their handshakes."""
+    judges = []
+    while len(judges) < expected:
+        sock, _ = server.accept()
+        conn = Connection(sock)
+        handshake = conn.receive()
+        assert handshake['name'] == 'handshake', handshake
+        conn.send({'name': 'handshake-success'})
+        judges.append((handshake['id'], conn, set(handshake['executors'])))
+        print(f'Judge {handshake["id"]} connected with {len(handshake["executors"])} executors', flush=True)
+    return judges
+
+
 def main() -> None:
     testsuite = sys.argv[1]
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 9999
     problem_regex = sys.argv[3] if len(sys.argv) > 3 else '.*'
+    # How many judges connect: one process may present itself as several.
+    judge_count = int(os.environ.get('JUDGE_COUNT') or 1)
     submissions = list(load_submissions(testsuite, problem_regex))
 
     server = socket.create_server(('0.0.0.0', port))
-    print(f'Waiting for a judge on port {port} ({len(submissions)} submissions queued)...', flush=True)
-    sock, _ = server.accept()
-    conn = Connection(sock)
-    handshake = conn.receive()
-    assert handshake['name'] == 'handshake', handshake
-    conn.send({'name': 'handshake-success'})
-    executors = set(handshake['executors'])
-    print(f'Judge {handshake["id"]} connected with {len(executors)} executors', flush=True)
+    print(f'Waiting for {judge_count} judge(s) on port {port} ({len(submissions)} submissions queued)...', flush=True)
+    judges = connect_judges(server, judge_count)
 
     abort_after = float(os.environ.get('ABORT_AFTER') or 0)
     if abort_after:
+        _, conn, _ = judges[0]
         problem, case, config, source = submissions[0]
         abort = threading.Timer(abort_after, lambda: conn.send({'name': 'terminate-submission', 'submission-id': 1}))
         abort.start()
         begin = time.monotonic()
         stored, outcome, _ = grade(conn, 1, problem, config, source)
         print(f'{problem}/{case}: {outcome} after {time.monotonic() - begin:.1f}s, {len(stored)} cases stored')
-        conn.send({'name': 'disconnect'})
+        for _, each, _ in judges:
+            each.send({'name': 'disconnect'})
         sys.exit(0 if outcome == 'aborted' else 1)
 
-    failures, graded, started = 0, 0, time.monotonic()
-    for sub_id, (problem, case, config, source) in enumerate(submissions, start=1):
-        needed = {config['language'], *config.get('required_auxiliary_executors', [])}
-        if not needed <= executors:
-            continue
-        begin = time.monotonic()
-        stored, outcome, details = grade(conn, sub_id, problem, config, source)
-        errors = check(config, stored, outcome)
-        graded += 1
-        status = 'ok' if not errors else 'FAIL'
-        times = sorted(case['time'] for case in stored.values() if case['status'] != 'SC')
-        cpu = f', CPU per case median {times[len(times) // 2]:.2f}s max {times[-1]:.2f}s' if times else ''
-        print(
-            f'[{status}] {problem}/{case} ({config["language"]}): {outcome}, {len(stored)} cases, '
-            f'{time.monotonic() - begin:.1f}s{cpu}',
-            flush=True,
-        )
-        if errors:
-            failures += 1
-            for error in errors:
-                print(f'    {error}', flush=True)
-            if details:
-                print('    ' + details.strip().replace('\n', '\n    '), flush=True)
+    # Every judge takes the next queued submission it can grade, like the site's bridge handing out work.
+    queue = list(enumerate(submissions, start=1))
+    lock = threading.Lock()
+    totals = {'graded': 0, 'failures': 0}
+    started = time.monotonic()
 
-    print(f'{graded} submissions graded in {time.monotonic() - started:.0f}s, {failures} failed', flush=True)
-    conn.send({'name': 'disconnect'})
-    sys.exit(1 if failures else 0)
+    def judge_loop(name: str, conn: Connection, executors: set) -> None:
+        while True:
+            with lock:
+                index = next(
+                    (
+                        i
+                        for i, (_, (_, _, config, _)) in enumerate(queue)
+                        if {config['language'], *config.get('required_auxiliary_executors', [])} <= executors
+                    ),
+                    None,
+                )
+                if index is None:
+                    return
+                sub_id, (problem, case, config, source) = queue.pop(index)
+            begin = time.monotonic()
+            stored, outcome, details = grade(conn, sub_id, problem, config, source)
+            errors = check(config, stored, outcome)
+            times = sorted(case['time'] for case in stored.values() if case['status'] != 'SC')
+            cpu = f', CPU per case median {times[len(times) // 2]:.2f}s max {times[-1]:.2f}s' if times else ''
+            status = 'ok' if not errors else 'FAIL'
+            with lock:
+                totals['graded'] += 1
+                totals['failures'] += bool(errors)
+                print(
+                    f'[{status}] {problem}/{case} ({config["language"]}): {outcome}, {len(stored)} cases, '
+                    f'{time.monotonic() - begin:.1f}s{cpu} [{name}]',
+                    flush=True,
+                )
+                if errors:
+                    for error in errors:
+                        print(f'    {error}', flush=True)
+                    if details:
+                        print('    ' + details.strip().replace('\n', '\n    '), flush=True)
+
+    threads = [threading.Thread(target=judge_loop, args=judge, daemon=True) for judge in judges]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    print(
+        f'{totals["graded"]} submissions graded in {time.monotonic() - started:.0f}s on {len(judges)} judge(s), '
+        f'{totals["failures"]} failed',
+        flush=True,
+    )
+    for _, conn, _ in judges:
+        conn.send({'name': 'disconnect'})
+    sys.exit(1 if totals['failures'] else 0)
 
 
 if __name__ == '__main__':

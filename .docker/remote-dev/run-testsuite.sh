@@ -42,6 +42,10 @@ PY
   export JUDGE_CONFIG=judge-microvm-checkpoint.yml
 fi
 
+# The judge config may present the process as several judges; the fake site must expect that many.
+export JUDGE_COUNT=$(sed -n 's/^ *judge_count: *//p' "${JUDGE_CONFIG:-judge.yml}" | head -1)
+export JUDGE_COUNT=${JUDGE_COUNT:-1}
+
 PROBLEMS="${1:-.*}" docker compose up -d --quiet-pull
 # The site container exits when every submission is checked; its exit code is the verdict.
 status=$(docker wait "$(docker compose ps -aq site)")

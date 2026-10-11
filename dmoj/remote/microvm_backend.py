@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+import requests.adapters
 
 from dmoj.remote.backend import CreationCancelled, VM, VMBackend, wait_until_healthy
 
@@ -66,6 +67,11 @@ class MicroVMBackend(VMBackend):
 
         self._http = requests.Session()
         self._http.headers['Authorization'] = f'Bearer {self.api_token}'
+        # Many VMs are created and polled at once; the default pool of 10 connections would be discarded and
+        # reopened constantly.
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=64)
+        self._http.mount('https://', adapter)
+        self._http.mount('http://', adapter)
 
     def _api(self, method: str, path: str, ok=(200, 201, 204), **kwargs) -> requests.Response:
         """Calls the API, retrying rate limiting and server errors with backoff."""

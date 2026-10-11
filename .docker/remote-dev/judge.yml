@@ -8,7 +8,11 @@ problem_storage_globs:
 
 remote_grading: true
 remote:
-  max_vms: 4
+  # This process presents itself as 4 judges (`remote-dev-1` ... `-4`), grading 4 submissions at once
+  # from a pool of 12 VMs. No per-submission cap (`max_vms: 0`).
+  judge_count: 4
+  max_concurrent_vms: 12
+  max_vms: 0
   backend: docker
   docker:
     image: vnoj/judge-microvm:dev

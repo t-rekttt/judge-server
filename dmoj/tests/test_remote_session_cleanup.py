@@ -68,7 +68,7 @@ class RemoteSessionCleanupTest(unittest.TestCase):
             short_circuit=False,
             meta={},
         )
-        config = mock.Mock(max_vms=4, storage=mock.Mock())
+        config = mock.Mock(max_vms=4, max_concurrent_vms=8, storage=mock.Mock())
         with mock.patch('dmoj.remote.session.env', mock.Mock(remote=config)):
             session = RemoteGradingSession(submission, backend)
 

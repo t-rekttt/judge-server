@@ -73,8 +73,9 @@ Submission = NamedTuple(
 
 
 class Judge:
-    def __init__(self, packet_manager: packet.PacketManager) -> None:
+    def __init__(self, packet_manager: packet.PacketManager, vm_pool: Any = None) -> None:
         self.packet_manager = packet_manager
+        self.vm_pool = vm_pool
         self.current_judge_worker: Optional[JudgeWorker] = None
         self._grading_lock = threading.Lock()
 
@@ -146,7 +147,7 @@ class Judge:
 
         # FIXME(tbrindus): what if we receive an abort from the judge before IPC handshake completes? We'll send
         # an abort request down the pipe, possibly messing up the handshake.
-        self.current_judge_worker = JudgeWorker(submission)
+        self.current_judge_worker = JudgeWorker(submission, self.vm_pool)
 
         ipc_ready_signal = threading.Event()
         grading_thread = threading.Thread(
@@ -320,8 +321,10 @@ class Judge:
 
 
 class JudgeWorker:
-    def __init__(self, submission: Submission) -> None:
+    def __init__(self, submission: Submission, vm_pool: Any = None) -> None:
         self.submission = submission
+        # Shared by every submission this process grades at once (remote grading); created before the fork.
+        self.vm_pool = vm_pool
         self._abort_requested = False
         self._sent_sigkill_to_worker_process = False
         # FIXME(tbrindus): marked Any pending grader cleanups.
@@ -468,7 +471,7 @@ class JudgeWorker:
             # local grading doesn't depend on the remote grading module.
             from dmoj.remote.session import RemoteGradingSession
 
-            self.remote_session = RemoteGradingSession(self.submission)
+            self.remote_session = RemoteGradingSession(self.submission, pool=self.vm_pool)
             yield from self.remote_session.run()
             return
 
@@ -575,8 +578,10 @@ class JudgeWorker:
 
 
 class ClassicJudge(Judge):
-    def __init__(self, host, port, **kwargs) -> None:
-        super().__init__(packet.PacketManager(host, port, self, env['id'], env['key'], **kwargs))
+    def __init__(self, host, port, name: Optional[str] = None, vm_pool: Any = None, **kwargs) -> None:
+        super().__init__(
+            packet.PacketManager(host, port, self, name or env['id'], env['key'], **kwargs), vm_pool=vm_pool
+        )
 
 
 def sanity_check():
@@ -666,20 +671,43 @@ def main():  # pragma: no cover
 
     setproctitle('DMOJ Judge %s on %s' % (env['id'], make_host_port(judgeenv)))
 
-    judge = ClassicJudge(
-        judgeenv.server_host,
-        judgeenv.server_port,
-        secure=judgeenv.secure,
-        no_cert_check=judgeenv.no_cert_check,
-        cert_store=judgeenv.cert_store,
-    )
+    # With remote grading, one process can present itself as several judges, each holding its own connection to the
+    # site and grading its own submission, all drawing VMs from one shared pool.
+    judge_names = [env['id']]
+    vm_pool = None
+    if judgeenv.env.remote_grading:
+        from dmoj.remote.pool import VMPool
+
+        count = int(judgeenv.env.remote.judge_count or 1)
+        if count > 1:
+            judge_names = [f'{env["id"]}-{i}' for i in range(1, count + 1)]
+        vm_pool = VMPool(int(judgeenv.env.remote.max_concurrent_vms or 100))
+
+    judges = [
+        ClassicJudge(
+            judgeenv.server_host,
+            judgeenv.server_port,
+            name=name,
+            vm_pool=vm_pool,
+            secure=judgeenv.secure,
+            no_cert_check=judgeenv.no_cert_check,
+            cert_store=judgeenv.cert_store,
+        )
+        for name in judge_names
+    ]
+    judge = judges[0]
+
+    def update_all_problems():
+        for each in judges:
+            each.update_problems()
+
     monitor = Monitor()
-    monitor.callback = judge.update_problems
+    monitor.callback = update_all_problems
 
     if hasattr(signal, 'SIGUSR2'):
 
         def update_problem_signal(signum, frame):
-            judge.update_problems()
+            update_all_problems()
 
         signal.signal(signal.SIGUSR2, update_problem_signal)
 
@@ -699,13 +727,17 @@ def main():  # pragma: no cover
     print()
     with monitor:
         try:
+            # Every judge but the first listens on its own thread; the first keeps the main thread, as before.
+            for extra in judges[1:]:
+                threading.Thread(target=extra.listen, name=f'judge {extra.packet_manager.name}', daemon=True).start()
             judge.listen()
         except KeyboardInterrupt:
             pass
         except Exception:
             traceback.print_exc()
         finally:
-            judge.murder()
+            for each in judges:
+                each.murder()
             if api_server:
                 api_server.shutdown()
 

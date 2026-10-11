@@ -4,6 +4,21 @@ With `remote_grading: true`, the judge stops compiling and running submissions i
 disposable VMs, has them download the problem from S3-compatible storage, grades test cases in parallel across them, and
 reports results to the site as usual. The site needs no changes.
 
+## One process, several judges
+
+The site hands each judge one submission at a time. To grade several submissions at once without changing the site, one
+orchestrator process presents itself as `judge_count` judges, named `<id>-1` … `<id>-N`, all with the judge's key.
+Register those N names (same key) on the site. Each one holds its own connection and grades its own submission; they
+all draw VMs from one pool of `max_concurrent_vms`:
+
+- A submission's first VM is always granted (it waits for a free slot if the pool is full), so it can at least
+  compile and start.
+- Extra VMs are granted within the submission's fair share, `max_concurrent_vms / submissions being graded`, so
+  submissions split the pool evenly. The share grows as others finish.
+- `max_vms` can cap one submission on top of that; `0` means no cap.
+
+The site shows the same machine load for every one of these judges, since they share a machine.
+
 ## How a submission is graded
 
 1. **First VM:** downloads the problem's small files, compiles the submission and grades case 1.
@@ -63,7 +78,9 @@ The judge still needs `problem_storage_globs` (or `judge_version: 2` storages) t
 ```yaml
 remote_grading: true
 remote:
-  max_vms: 4              # VMs per submission, including the first
+  judge_count: 8          # present this process as 8 judges (`<id>-1` ... `<id>-8`), one submission each
+  max_concurrent_vms: 100 # VMs the whole process may run at once, shared by its judges
+  max_vms: 0              # per-submission cap on VMs; 0 = none
   backend: microvm        # or `docker` (local runner containers)
   microvm:
     api_token: dop_v1_... # scopes: microvm:create, microvm:read, microvm:delete, microvm:access
@@ -176,7 +193,9 @@ name it `judge-real-*.yml`, which git ignores.
 - VM lifecycle, endpoint auth (`Authorization` is consumed by the endpoint, so the runner's token travels in
   `X-Runner-Token`), checkpoints, and orphan cleanup by tag: all verified against the real API.
 - From the registry image, a runner VM is ready in about 70 s; from a checkpoint, in a few seconds.
-- Account limits during the preview: 32 GiB of MicroVM memory in total (16 VMs of 2 GiB), 1000 VMs.
+- Account limits during the preview: 32 GiB of MicroVM memory in total (16 VMs of 2 GiB), 1000 VMs. A
+  `max_concurrent_vms` above that is allowed in the configuration, but DigitalOcean refuses creations past the limit;
+  the judge keeps grading on the VMs it has and retries. Ask DigitalOcean to raise the limit.
 - A checkpoint stores the VM's whole allocated disk plus RAM, not just what is used: 52 GiB for the 1 vCPU / 2 GiB
   size (50 GB disk), 84 GiB for 2 vCPU / 4 GiB. At the documented $0.05/GiB-month that is a few dollars a month per
   checkpoint; keep one, and recreate it after image changes.
