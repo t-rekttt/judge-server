@@ -82,7 +82,7 @@ remote_grading: true
 remote:
   judge_count: 8          # present this process as 8 judges, one submission each
   judge_name_format: 'judge-{i}'            # judge-0 ... judge-7
-  judge_key_format: 'F2eo...{i}...57a'     # one key per judge, with its index inside
+  judge_key_format: 'secret-{i}-suffix'    # one key per judge, with its index inside
   judge_first_index: 0
   max_concurrent_vms: 100 # VMs the whole process may run at once, shared by its judges
   max_vms: 0              # per-submission cap on VMs; 0 = none
