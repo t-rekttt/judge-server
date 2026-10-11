@@ -1,5 +1,6 @@
 import multiprocessing
 import threading
+import time
 import unittest
 
 from dmoj.remote.pool import VMPool
@@ -116,3 +117,21 @@ class VMPoolTest(unittest.TestCase):
         pool = VMPool(1)
         self.assertTrue(pool.park(VM('a', 'u', 't')))
         self.assertFalse(pool.park(VM('b', 'u', 't')))
+
+    def test_reaper_keeps_the_standby_reserve(self):
+        from dmoj.remote.backend import VM
+
+        pool = VMPool(4)
+        for name in ('old', 'mid', 'new'):
+            self.assertTrue(pool.acquire_standby())
+            self.assertTrue(pool.park(VM(name, 'u', 't')))
+            time.sleep(0.01)
+        # Beyond the two newest, only the oldest ages out; the reserve stays whatever its age.
+        self.assertEqual([record['id'] for record in pool.reap_warm(0, keep=2)], ['old'])
+        self.assertEqual(pool.warm_count(), 2)
+        self.assertEqual(pool.reap_warm(0, keep=2), [])
+        # Shutdown takes everything.
+        self.assertEqual(sorted(record['id'] for record in pool.reap_warm(0)), ['mid', 'new'])
+        # Standby VMs never wait for a slot: the fourth slot is free, then the pool is full.
+        self.assertTrue(pool.acquire_standby())
+        self.assertFalse(pool.acquire_standby())

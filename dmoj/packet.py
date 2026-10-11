@@ -199,6 +199,8 @@ class PacketManager:
     def disconnect(self):
         self.close()
         self.judge.abort_grading()
+        # Ends this judge's thread. With several judges in one process, the main thread notices and shuts the whole
+        # process down (`judge.main`), so warm VMs are deleted.
         sys.exit(0)
 
     def _flush_testcase_queue(self):

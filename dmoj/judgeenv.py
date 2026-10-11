@@ -68,7 +68,7 @@ env: ConfigNode = ConfigNode(
         # at once, all sharing `remote.max_concurrent_vms` VMs. Their names and keys come from
         # `remote.judge_name_format` / `remote.judge_key_format` (`{i}` = index from `remote.judge_first_index`).
         # VMs of a finished submission are kept for the next one for `remote.warm_idle_seconds` (default 10; 0 to
-        # delete them at once).
+        # delete them at once), and `remote.warm_reserve_per_judge` VMs per judge are kept parked at all times.
         'remote_grading': False,
         'remote': {},
     },

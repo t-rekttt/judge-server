@@ -77,3 +77,22 @@ class CompiledCacheTest(unittest.TestCase):
         os.remove(first._executable)
         self.executor_class('p', b'Main class')
         self.assertEqual(self.compiles, 2)
+
+    def test_executor_without_an_executable_file_is_restored(self):
+        # Java's "executable" is the empty string: the program is the class files in the directory.
+        test = self
+
+        class FakeJava(self.executor_class):
+            def compile(self) -> str:
+                test.compiles += 1
+                with open(self._file('Main.class'), 'wb') as f:
+                    f.write(b'class')
+                self._executable = ''
+                return self._executable
+
+        first = FakeJava('p', b'Main class')
+        second = FakeJava('p', b'Main class')
+        self.assertEqual(self.compiles, 1)
+        self.assertEqual(second._dir, first._dir)
+        self.assertEqual(second._executable, '')
+        self.assertTrue(os.path.isfile(os.path.join(second._dir, 'Main.class')))

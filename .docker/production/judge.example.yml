@@ -20,6 +20,8 @@ remote:
   max_vms: 0
   # Keep a finished submission's VMs this long for the next one (0: delete them at once).
   warm_idle_seconds: 10
+  # Parked VMs kept ready per judge at all times, so a submission never waits for a VM to start (0: none).
+  warm_reserve_per_judge: 2
   backend: microvm
   microvm:
     api_url: https://api.digitalocean.com

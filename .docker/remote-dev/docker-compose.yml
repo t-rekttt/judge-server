@@ -67,6 +67,8 @@ services:
     # Orchestrating only: no ptrace or sandbox needed. It talks to the Docker Engine to create runners.
     entrypoint: ['/env/bin/dmoj', '-c', '/remote-dev/${JUDGE_CONFIG:-judge.yml}', '--skip-self-test', '--no-watchdog',
                  'site']
+    # On stop the judge deletes its warm and standby runners; give it time to, so none is counted as leaked.
+    stop_grace_period: 2m
     user: root
     environment:
       DMOJ_IN_DOCKER: '1'

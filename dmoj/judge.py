@@ -732,10 +732,16 @@ def main():  # pragma: no cover
             vm_pool.disown(vm.id)
             vm_pool.release()
 
-        def retire_warm_vms(idle: float) -> List[threading.Thread]:
+        # Standby reserve: parked VMs kept at all times, so a submission arriving at an idle judge starts at once.
+        reserve = count * int(remote.warm_reserve_per_judge or 0) if warm_idle > 0 else 0
+        stopping = threading.Event()
+        standby_lock = threading.Lock()
+        standby_creating = 0
+
+        def retire_warm_vms(idle: float, keep: int) -> List[threading.Thread]:
             threads = [
                 threading.Thread(target=retire_warm_vm, args=(record,), name='retire warm vm', daemon=True)
-                for record in vm_pool.reap_warm(idle)
+                for record in vm_pool.reap_warm(idle, keep)
             ]
             for thread in threads:
                 thread.start()
@@ -743,15 +749,54 @@ def main():  # pragma: no cover
 
         def reap_warm_vms() -> None:
             """Deletes VMs parked between submissions for longer than the idle timeout: they cost money while idle."""
-            while True:
+            while not stopping.is_set():
                 time.sleep(1)
                 try:
-                    retire_warm_vms(warm_idle)
+                    retire_warm_vms(warm_idle, reserve)
                 except Exception:
                     logger.exception('Deleting idle warm VMs failed; will retry')
 
+        def create_standby_vm(label: str) -> None:
+            nonlocal standby_creating
+            try:
+                vm = warm_backend.create_vm(label, stopping)
+                vm_pool.own(vm.id)
+                if stopping.is_set() or not vm_pool.park(vm):
+                    # Nobody will take it: the judge is stopping (the final sweep may already have run), or the
+                    # pool has no room to park it.
+                    retire_warm_vm(vm._asdict())
+                    return
+            except Exception:
+                vm_pool.release()
+                if not stopping.is_set():
+                    logger.exception('Creating a standby VM failed; will retry')
+                    time.sleep(10)
+                return
+            finally:
+                with standby_lock:
+                    standby_creating -= 1
+
+        def keep_standby_vms() -> None:
+            """Tops the parked VMs up to the reserve as submissions take them."""
+            nonlocal standby_creating
+            n = 0
+            while not stopping.is_set():
+                time.sleep(1)
+                with standby_lock:
+                    deficit = reserve - vm_pool.warm_count() - standby_creating
+                    for _ in range(deficit):
+                        if not vm_pool.acquire_standby():
+                            break  # the pool is full of grading VMs; try again later
+                        standby_creating += 1
+                        n += 1
+                        threading.Thread(
+                            target=create_standby_vm, args=(f'standby-{n}',), name='standby vm', daemon=True
+                        ).start()
+
         if warm_idle > 0:
             threading.Thread(target=reap_warm_vms, name='warm vm reaper', daemon=True).start()
+        if reserve > 0:
+            threading.Thread(target=keep_standby_vms, name='standby vms', daemon=True).start()
 
     judges = [
         ClassicJudge(
@@ -806,10 +851,18 @@ def main():  # pragma: no cover
     print()
     with monitor:
         try:
-            # Every judge but the first listens on its own thread; the first keeps the main thread, as before.
-            for extra in judges[1:]:
-                threading.Thread(target=extra.listen, name=f'judge {extra.packet_manager.name}', daemon=True).start()
-            judge.listen()
+            # Every judge listens on its own thread; the main thread waits for any of them to stop (a `disconnect`
+            # from the site, or an exception), then shuts the process down: one judge can't stop by itself with
+            # warm and standby VMs shared by all of them.
+            listeners = [
+                threading.Thread(target=each.listen, name=f'judge {each.packet_manager.name}', daemon=True)
+                for each in judges
+            ]
+            for thread in listeners:
+                thread.start()
+            while all(thread.is_alive() for thread in listeners):
+                time.sleep(0.5)
+            logger.info('A judge stopped; shutting down')
         except KeyboardInterrupt:
             pass
         except Exception:
@@ -818,8 +871,17 @@ def main():  # pragma: no cover
             for each in judges:
                 each.murder()
             if vm_pool is not None:
-                # Parked VMs would otherwise run until the next start of this judge sweeps them.
-                for thread in retire_warm_vms(0):
+                # Parked VMs would otherwise run until the next start of this judge sweeps them. Standby VMs still
+                # being created notice `stopping` and are deleted by their creator, unless creation finished just
+                # before: those are parked and taken by the final sweep below.
+                stopping.set()
+                deadline = time.monotonic() + 120
+                while time.monotonic() < deadline:
+                    with standby_lock:
+                        if standby_creating == 0:
+                            break
+                    time.sleep(0.5)
+                for thread in retire_warm_vms(0, 0):
                     thread.join()
             if api_server:
                 api_server.shutdown()

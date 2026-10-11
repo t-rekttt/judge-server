@@ -13,6 +13,9 @@ Rules:
 - Warm VMs: a submission that finishes cleanly parks its VMs instead of deleting them, and the next submission takes
   them (any problem, any user) instead of creating new ones. A parked VM keeps its slot. A reaper in the main process
   deletes VMs parked longer than the idle timeout, since they cost money while idle.
+- Standby VMs: the main process keeps a reserve of parked VMs at all times (`warm_reserve_per_judge` per judge), so
+  a submission arriving at an idle judge starts on a VM that already runs instead of waiting for one to be created.
+  The reaper never deletes the newest `reserve` parked VMs, whatever their age.
 """
 
 import json
@@ -137,18 +140,26 @@ class VMPool:
             self._clear_warm(newest)
         return json.loads(record)
 
-    def reap_warm(self, idle_seconds: float) -> List[Dict[str, Any]]:
-        """Removes VMs parked longer than `idle_seconds` (all of them if 0). The caller deletes them and releases
-        their slots."""
+    def reap_warm(self, idle_seconds: float, keep: int = 0) -> List[Dict[str, Any]]:
+        """
+        Removes VMs parked longer than `idle_seconds` (all of them if 0), except the newest `keep`, which stay as the
+        standby reserve. The caller deletes them and releases their slots.
+        """
         now = time.monotonic()
         reaped = []
         with self._warm_lock:
-            for i in range(self.capacity):
-                record = self._warm_record(i)
-                if record and now - self._warm_since[i] >= idle_seconds:
-                    reaped.append(json.loads(record))
+            parked = sorted(
+                (i for i in range(self.capacity) if self._warm_record(i)), key=lambda i: -self._warm_since[i]
+            )
+            for i in parked[keep:]:
+                if now - self._warm_since[i] >= idle_seconds:
+                    reaped.append(json.loads(self._warm_record(i)))
                     self._clear_warm(i)
         return reaped
+
+    def acquire_standby(self) -> bool:
+        """A slot for a standby VM, if one is free right now; standby VMs never wait for a slot."""
+        return self._slots.acquire(block=False)
 
     def warm_count(self) -> int:
         with self._warm_lock:

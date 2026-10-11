@@ -47,10 +47,12 @@ class _CompiledExecutorMeta(ExecutorMeta):
 
             cache_file_path = os.path.join(tempfile.gettempdir(), cache_key + '.txt')
             if os.path.isfile(cache_file_path):
-                executor = open(cache_file_path).read().strip().split('\n')
+                # Two lines: the executable and the directory. The executable is empty for executors whose program
+                # is the directory's contents (Java), so don't strip the file as a whole.
+                executor = open(cache_file_path).read().split('\n')
                 assert len(executor) == 2
                 # Minimal sanity checking: is the file still there? If not, we'll just recompile.
-                if os.path.isfile(executor[0]):
+                if os.path.isfile(executor[0]) or (not executor[0] and os.path.isdir(executor[1])):
                     obj._executable = executor[0]
                     obj._dir = executor[1]
                     if not getattr(cls, 'restorable_from_cache', False):

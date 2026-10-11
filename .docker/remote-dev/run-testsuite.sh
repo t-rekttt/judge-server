@@ -55,5 +55,8 @@ docker compose logs --no-color --no-log-prefix site
 sleep 15
 leaked=$(docker ps -q --filter "$runner_filter" | wc -l)
 echo "Runner VMs left after grading: $leaked"
+docker ps --filter "$runner_filter" --format '  left: {{.Names}} (created {{.CreatedAt}})'
+# The judge's log, for looking into failures and leaks after the stack is torn down.
+docker compose logs --no-color --no-log-prefix judge > /tmp/testsuite-judge.log 2>&1 || true
 [ "$leaked" = 0 ] || status=1
 exit "$status"

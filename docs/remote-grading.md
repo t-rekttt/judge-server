@@ -49,6 +49,11 @@ The site shows the same machine load for every one of these judges, since they s
    and stays in the ownership record, so the sweeper leaves it alone. A reaper thread in the main process deletes
    VMs parked longer than `warm_idle_seconds` (default 10; `0` disables reuse), and all of them when the judge
    stops. Parking skips the VM start-up and the gateway's warm-up, which were most of a short submission's time.
+8. **Standby reserve.** With `warm_reserve_per_judge`, the judge keeps that many parked VMs per judge at all times
+   (`judge_count × warm_reserve_per_judge` in total), creating them at start-up and again as submissions take them.
+   The reaper never deletes the newest `reserve` parked VMs, so a submission arriving at an idle judge compiles on a
+   VM that already runs instead of waiting for one to be created; only VMs beyond the reserve age out. The reserve
+   costs that many idle VMs around the clock.
 
 Code: `dmoj/remote/`
 - `session.py`: the orchestrator.
@@ -100,6 +105,7 @@ remote:
   max_concurrent_vms: 100 # VMs the whole process may run at once, shared by its judges
   max_vms: 0              # per-submission cap on VMs; 0 = none
   warm_idle_seconds: 10   # keep a finished submission's VMs this long for the next one; 0 = delete at once
+  warm_reserve_per_judge: 2  # parked VMs kept ready per judge at all times (16 here); 0 = none
   backend: microvm        # or `docker` (local runner containers)
   microvm:
     api_token: dop_v1_... # scopes: microvm:create, microvm:read, microvm:delete, microvm:access
