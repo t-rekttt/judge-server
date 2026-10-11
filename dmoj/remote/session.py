@@ -1,9 +1,10 @@
 """
 Grades one submission in disposable VMs while the judge only orchestrates.
 
-1. The first VM downloads the problem, compiles the submission and grades case 1. On a compile error, grading stops
-   there, without creating any other VM.
-2. Other VMs start in parallel, download the problem and take the first VM's compiled programs, so they never compile.
+1. The first VM downloads the problem and compiles the submission. On a compile error, grading stops there, without
+   creating any other VM.
+2. Other VMs start as soon as compilation succeeds, while the first VM grades its first case. They download the
+   problem and take the first VM's compiled programs, so they never compile the submission.
 3. Every VM repeatedly takes the next case still worth grading. Results go through the `Emitter`, which reports them
    with the same verdicts and in an order the site handles.
 4. When grading ends cleanly, every VM is reset and parked in the pool for the next submission (any problem, any
@@ -403,7 +404,7 @@ class RemoteGradingSession:
                 self._prepare(runner)
                 runner.call('/artifact', SETUP_TIMEOUT, data=artifact)
                 # Builds the grader; with the artifact in place, nothing is compiled again.
-                runner.call('/compile', SETUP_TIMEOUT, json={'grade_first': False})
+                runner.call('/compile', SETUP_TIMEOUT)
                 return runner
 
             return factory
