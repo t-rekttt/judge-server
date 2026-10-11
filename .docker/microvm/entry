@@ -1,0 +1,87 @@
+#!/bin/bash
+# MicroVM entrypoint for the judge image. Configured only through environment variables:
+#   JUDGE_MODE=idle  keep the VM alive so commands can be run with `exec` (default)
+#   JUDGE_MODE=test  run the judge self-tests + testsuite once, results served over HTTP
+#   JUDGE_MODE=bench run the timing-stability benchmark (BENCH_RUNS, default 50); summary served as `bench.json`
+#   JUDGE_MODE=runner grading service for an orchestrating judge (remote grading); needs RUNNER_TOKEN. It serves
+#                    the HTTP port itself, so the status page isn't started.
+#   JUDGE_MODE=run   connect to the site: needs DMOJ_SERVER_HOST, DMOJ_JUDGE_NAME, DMOJ_JUDGE_KEY
+#                    (optional DMOJ_SERVER_PORT, default 9999; DMOJ_JUDGE_ARGS for extra flags)
+# The HTTP port always serves $STATUS_DIR: `status` (running/passed/failed/exited) and `log`.
+
+export DMOJ_IN_DOCKER=1 PYTHONUNBUFFERED=1 LANG=C.UTF-8 PYTHONIOENCODING=utf8
+
+STATUS_DIR=/tmp/microvm-status
+mkdir -p "$STATUS_DIR"
+echo running > "$STATUS_DIR/status"
+: > "$STATUS_DIR/log"
+
+# Keeps the VM's HTTP endpoint answering for the whole lifetime of the VM.
+if [ "${JUDGE_MODE:-idle}" != runner ]; then
+  /env/bin/python3 -m http.server "${MICROVM_HTTP_PORT:-8080}" --directory "$STATUS_DIR" >/dev/null 2>&1 &
+fi
+
+# The stock entry drops from root to the judge user with setpriv; MicroVMs may already start us as
+# an unprivileged user without CAP_SETUID, in which case we just run as whoever we are.
+if [ "$(id -u)" = 0 ]; then
+  export HOME=~judge
+  as_judge=(setpriv --reuid judge --regid judge --clear-groups)
+else
+  # Arbitrary uid without a passwd entry: register it with ~judge as home, which the image makes group-0 accessible.
+  if ! getent passwd "$(id -u)" >/dev/null; then
+    echo "judge-vm:x:$(id -u):0:MicroVM judge:/home/judge:/bin/sh" >> /etc/passwd
+  fi
+  export HOME=/home/judge
+  as_judge=()
+fi
+[ -f ~judge/.profile ] && . ~judge/.profile
+cd /judge || exit 1
+
+record() {
+  "$@" >> "$STATUS_DIR/log" 2>&1
+}
+
+case "${JUDGE_MODE:-idle}" in
+idle) ;;
+test)
+  {
+    echo "== whoami: $(id) =="
+    grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+    echo '== executor self-tests =='
+  } >> "$STATUS_DIR/log"
+  # autoconf always exits 0; its per-language lines in the log show which runtimes failed self-tests.
+  # The testsuite exit code alone decides pass/fail.
+  record "${as_judge[@]}" /env/bin/dmoj-autoconf -V
+  echo '== testsuite ==' >> "$STATUS_DIR/log"
+  if record "${as_judge[@]}" /env/bin/python3 -m dmoj.testsuite testsuite; then
+    echo passed > "$STATUS_DIR/status"
+  else
+    echo failed > "$STATUS_DIR/status"
+  fi
+  ;;
+bench)
+  if "${as_judge[@]}" /env/bin/python3 /judge/.docker/microvm/timing_benchmark.py "${BENCH_RUNS:-50}" \
+    > "$STATUS_DIR/bench.json" 2>> "$STATUS_DIR/log"; then
+    echo passed > "$STATUS_DIR/status"
+  else
+    echo failed > "$STATUS_DIR/status"
+  fi
+  ;;
+runner)
+  : "${RUNNER_TOKEN:?RUNNER_TOKEN is required}"
+  exec "${as_judge[@]}" /env/bin/python3 -m dmoj.remote.runner --port "${MICROVM_HTTP_PORT:-8080}"
+  ;;
+run)
+  : "${DMOJ_SERVER_HOST:?DMOJ_SERVER_HOST is required}"
+  # shellcheck disable=SC2086 # DMOJ_JUDGE_ARGS is intentionally word-split into flags
+  record "${as_judge[@]}" /env/bin/dmoj -p "${DMOJ_SERVER_PORT:-9999}" $DMOJ_JUDGE_ARGS "$DMOJ_SERVER_HOST"
+  echo "exited $?" > "$STATUS_DIR/status"
+  ;;
+*)
+  echo "unknown JUDGE_MODE=$JUDGE_MODE (expected idle, test or run)" >> "$STATUS_DIR/log"
+  echo failed > "$STATUS_DIR/status"
+  ;;
+esac
+
+# Never exit: the VM must stay up so the result can be read and `exec` keeps working.
+exec sleep infinity

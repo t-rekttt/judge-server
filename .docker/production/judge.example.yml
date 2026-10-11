@@ -1,0 +1,41 @@
+# Production orchestrating judge. Copy to judge.yml next to docker-compose.yml and fill in the credentials.
+# This file then holds secrets: keep it private (chmod 600) and out of version control.
+id: judge
+key: unused-when-judge_key_format-is-set
+
+# The problems the judges announce to the site: <problem>/init.yml for each, fetched from storage by
+# `docker compose run --rm problems`. The VMs read the actual problem data from storage.
+problem_storage_globs:
+  - /problems/*
+
+remote_grading: true
+remote:
+  # This process presents itself as these judges; register them on the site with these names and keys.
+  judge_count: 8
+  judge_name_format: 'judge-{i}'                  # judge-0 ... judge-7
+  judge_key_format: 'change-me-judge-{i}-suffix'  # the key of judge-<i>
+  judge_first_index: 0
+  # VMs the whole process may run at once, shared by its judges; no per-submission cap.
+  max_concurrent_vms: 100
+  max_vms: 0
+  # Keep a finished submission's VMs this long for the next one (0: delete them at once).
+  warm_idle_seconds: 10
+  # Parked VMs kept ready per judge at all times, so a submission never waits for a VM to start (0: none).
+  warm_reserve_per_judge: 2
+  backend: microvm
+  microvm:
+    api_url: https://api.digitalocean.com
+    api_token: dop_v1_...      # scopes: microvm:create, microvm:read, microvm:delete, microvm:access
+    region: mkc1
+    # From create_checkpoint.py (docs/remote-grading.md, "Checkpoints"); recreate after every image change.
+    checkpoint_id: ...
+    checkpoint_runner_token: ...
+    ready_timeout: 600
+  storage:
+    endpoint: https://sgp1.digitaloceanspaces.com
+    bucket: tas-problems
+    prefix: tests
+    access_key: ...            # a read-only Spaces key is enough
+    secret_key: ...
+    region: us-east-1
+    url_expiry: 900

@@ -61,6 +61,16 @@ env: ConfigNode = ConfigNode(
         'tempdir': None,
         # CPU affinity (as a list of 0-indexed CPU IDs) to run submissions on
         'submission_cpu_affinity': None,
+        # Cache submissions like auxiliary programs, so their compiled form can be reused (remote grading runners)
+        'cache_all_compiled_binaries': False,
+        # Grade in disposable VMs instead of locally; see docs/remote-grading.md for the `remote` settings.
+        # `remote.judge_count` makes this process present itself as that many judges to grade that many submissions
+        # at once, all sharing `remote.max_concurrent_vms` VMs. Their names and keys come from
+        # `remote.judge_name_format` / `remote.judge_key_format` (`{i}` = index from `remote.judge_first_index`).
+        # VMs of a finished submission are kept for the next one for `remote.warm_idle_seconds` (default 10; 0 to
+        # delete them at once), and `remote.warm_reserve_per_judge` VMs per judge are kept parked at all times.
+        'remote_grading': False,
+        'remote': {},
     },
     dynamic=False,
 )

@@ -18,7 +18,7 @@ from dmoj.control import JudgeControlRequestHandler
 from dmoj.error import CompileError
 from dmoj.judgeenv import env, get_supported_problems_and_mtimes, startup_warnings
 from dmoj.monitor import Monitor
-from dmoj.problem import BaseTestCase, BatchedTestCase, Problem, TestCase
+from dmoj.problem import Problem, TestCase
 from dmoj.result import Result
 from dmoj.utils import builtin_int_patch
 from dmoj.utils.ansi import ansi_style, print_ansi, strip_ansi
@@ -73,8 +73,9 @@ Submission = NamedTuple(
 
 
 class Judge:
-    def __init__(self, packet_manager: packet.PacketManager) -> None:
+    def __init__(self, packet_manager: packet.PacketManager, vm_pool: Any = None) -> None:
         self.packet_manager = packet_manager
+        self.vm_pool = vm_pool
         self.current_judge_worker: Optional[JudgeWorker] = None
         self._grading_lock = threading.Lock()
 
@@ -146,7 +147,7 @@ class Judge:
 
         # FIXME(tbrindus): what if we receive an abort from the judge before IPC handshake completes? We'll send
         # an abort request down the pipe, possibly messing up the handshake.
-        self.current_judge_worker = JudgeWorker(submission)
+        self.current_judge_worker = JudgeWorker(submission, self.vm_pool)
 
         ipc_ready_signal = threading.Event()
         grading_thread = threading.Thread(
@@ -239,7 +240,12 @@ class Judge:
                 colored_aux_codes,
             )
         case_padding = '  ' if batch_number is not None else ''
-        report(ansi_style('%sTest case %2d %-3s %s' % (case_padding, case_number, colored_codes[0], case_info)))
+        report(
+            ansi_style(
+                '%sTest case %2d %-3s %s #%s'
+                % (case_padding, case_number, colored_codes[0], case_info, self.current_submission.id)
+            )
+        )
         self.packet_manager.test_case_status_packet(case_number, result)
         self.case_verdicts[codes[0]] += 1
 
@@ -320,12 +326,15 @@ class Judge:
 
 
 class JudgeWorker:
-    def __init__(self, submission: Submission) -> None:
+    def __init__(self, submission: Submission, vm_pool: Any = None) -> None:
         self.submission = submission
+        # Shared by every submission this process grades at once (remote grading); created before the fork.
+        self.vm_pool = vm_pool
         self._abort_requested = False
         self._sent_sigkill_to_worker_process = False
         # FIXME(tbrindus): marked Any pending grader cleanups.
         self.grader: Any = None
+        self.remote_session: Any = None
 
         self.mp_contex = multiprocessing.get_context('fork')
         self.worker_process_conn, child_conn = self.mp_contex.Pipe()
@@ -338,7 +347,8 @@ class JudgeWorker:
         child_conn.close()
 
     def communicate(self) -> Generator[Tuple[IPC, tuple], None, None]:
-        recv_timeout = max(60, int(2 * self.submission.time_limit))
+        # Remote grading creates VMs and downloads problem data before it reports anything.
+        recv_timeout = max(900 if env.remote_grading else 60, int(2 * self.submission.time_limit))
         while True:
             try:
                 if not self.worker_process_conn.poll(timeout=recv_timeout):
@@ -461,6 +471,15 @@ class JudgeWorker:
             self.grader = None
 
     def _grade_cases(self) -> Generator[Tuple[IPC, tuple], None, None]:
+        if env.remote_grading:
+            # Compile and run every case in disposable VMs; this process only orchestrates. Imported lazily so that
+            # local grading doesn't depend on the remote grading module.
+            from dmoj.remote.session import RemoteGradingSession
+
+            self.remote_session = RemoteGradingSession(self.submission, pool=self.vm_pool)
+            yield from self.remote_session.run()
+            return
+
         problem = Problem(
             self.submission.problem_id,
             self.submission.time_limit,
@@ -484,17 +503,7 @@ class JudgeWorker:
 
         yield IPC.GRADING_BEGIN, (problem.run_pretests_only,)
 
-        flattened_cases: List[Tuple[Optional[int], BaseTestCase]] = []
-        batch_number = 0
-        batch_dependencies: List[Set[int]] = []
-        for case in problem.cases():
-            if isinstance(case, BatchedTestCase):
-                batch_number += 1
-                for batched_case in case.batched_cases:
-                    flattened_cases.append((batch_number, batched_case))
-                batch_dependencies.append(set(case.dependencies))
-            else:
-                flattened_cases.append((None, case))
+        flattened_cases, batch_dependencies = problem.flattened_cases()
 
         case_number = 0
         is_short_circuiting = False
@@ -569,11 +578,17 @@ class JudgeWorker:
         self._abort_requested = True
         if self.grader:
             self.grader.abort_grading()
+        if self.remote_session:
+            self.remote_session.abort()
 
 
 class ClassicJudge(Judge):
-    def __init__(self, host, port, **kwargs) -> None:
-        super().__init__(packet.PacketManager(host, port, self, env['id'], env['key'], **kwargs))
+    def __init__(
+        self, host, port, name: Optional[str] = None, key: Optional[str] = None, vm_pool: Any = None, **kwargs
+    ) -> None:
+        super().__init__(
+            packet.PacketManager(host, port, self, name or env['id'], key or env['key'], **kwargs), vm_pool=vm_pool
+        )
 
 
 def sanity_check():
@@ -624,12 +639,23 @@ def main():  # pragma: no cover
     unicode_stdout_stderr()
     builtin_int_patch.apply()
 
-    if not sanity_check():
-        return 1
-
     from dmoj import judgeenv, contrib, executors
 
     judgeenv.load_env()
+
+    # With remote grading this process only orchestrates: it never compiles or runs code, so it doesn't need the
+    # sandbox. It still loads the executors (same image and runtime configuration as the VMs) to tell the site which
+    # languages the VMs support; run it with --skip-self-test, since the image's executors were tested when built.
+    if judgeenv.env.remote_grading:
+        from dmoj.remote.backend import make_backend
+        from dmoj.remote.rate_limit import shared_limiter
+
+        # Built before any worker is forked, so every caller of the VM API paces itself against the same budget.
+        shared_limiter()
+        # VMs of submissions that were grading when this judge last stopped would otherwise run until auto-paused.
+        make_backend(judgeenv.env.remote, env['id']).delete_orphans()
+    elif not sanity_check():
+        return 1
 
     executors.load_executors()
     contrib.load_contrib_modules()
@@ -655,20 +681,178 @@ def main():  # pragma: no cover
 
     setproctitle('DMOJ Judge %s on %s' % (env['id'], make_host_port(judgeenv)))
 
-    judge = ClassicJudge(
-        judgeenv.server_host,
-        judgeenv.server_port,
-        secure=judgeenv.secure,
-        no_cert_check=judgeenv.no_cert_check,
-        cert_store=judgeenv.cert_store,
-    )
+    # With remote grading, one process can present itself as several judges, each holding its own connection to the
+    # site and grading its own submission, all drawing VMs from one shared pool.
+    identities = [(env['id'], env['key'])]
+    vm_pool = None
+    if judgeenv.env.remote_grading:
+        from dmoj.remote.pool import VMPool
+
+        remote = judgeenv.env.remote
+        count = int(remote.judge_count or 1)
+        if count > 1:
+            # Each judge's name and key come from patterns with `{i}` (its index), `{id}` and `{key}`.
+            name_format = remote.judge_name_format or '{id}-{i}'
+            key_format = remote.judge_key_format or '{key}'
+            first = int(remote.judge_first_index or 0)
+            identities = [
+                (
+                    name_format.format(i=i, id=env['id'], key=env['key']),
+                    key_format.format(i=i, id=env['id'], key=env['key']),
+                )
+                for i in range(first, first + count)
+            ]
+        vm_pool = VMPool(int(remote.max_concurrent_vms or 100))
+
+        def sweep_leftover_vms() -> None:
+            """Deletes this judge's VMs that no submission owns: deletions that failed (API rate limits) and crashes."""
+            from dmoj.remote.microvm_backend import SWEEP_INTERVAL
+
+            from dmoj.remote.session import MAX_SUBMISSION_SECONDS
+
+            backend = make_backend(remote, env['id'])
+            while True:
+                time.sleep(SWEEP_INTERVAL)
+                try:
+                    # A VM younger than the longest a submission can take is never swept, whatever the ownership
+                    # record says: a wrong deletion costs a submission, a late one only money.
+                    backend.delete_orphans(keep=vm_pool.owned(), min_age=MAX_SUBMISSION_SECONDS)
+                except Exception:
+                    logger.exception('Sweeping leftover VMs failed; will retry')
+
+        threading.Thread(target=sweep_leftover_vms, name='vm sweeper', daemon=True).start()
+
+        import requests
+
+        from dmoj.remote.backend import VM
+        from dmoj.remote.session import DEFAULT_WARM_IDLE_SECONDS
+
+        # Parked VMs are pinged this often (seconds): well within the platform's 5-minute auto-pause timeout, so
+        # the standby reserve stays awake, while a VM the judge lost track of pauses as a safeguard.
+        KEEPALIVE_INTERVAL = 120
+
+        warm_idle = remote.warm_idle_seconds
+        warm_idle = float(DEFAULT_WARM_IDLE_SECONDS if warm_idle is None else warm_idle)
+        warm_backend = make_backend(remote, env['id'])
+
+        def retire_warm_vm(record: dict) -> None:
+            vm = VM(**record)
+            try:
+                warm_backend.delete_vm(vm)  # never raises; a failed deletion is logged and left to the sweeper
+            finally:
+                # The record and the slot are given back whatever happened to the VM: the sweeper finds a VM that
+                # nobody owns and that stayed alive, while a slot kept forever would shrink the pool for good.
+                vm_pool.disown(vm.id)
+                vm_pool.release()
+
+        # Standby reserve: parked VMs kept at all times, so a submission arriving at an idle judge starts at once.
+        reserve = count * int(remote.warm_reserve_per_judge or 0) if warm_idle > 0 else 0
+        stopping = threading.Event()
+        standby_lock = threading.Lock()
+        standby_creating = 0
+
+        def retire_warm_vms(idle: float, keep: int) -> List[threading.Thread]:
+            threads = [
+                threading.Thread(target=retire_warm_vm, args=(record,), name='retire warm vm', daemon=True)
+                for record in vm_pool.reap_warm(idle, keep)
+            ]
+            for thread in threads:
+                thread.start()
+            return threads
+
+        def reap_warm_vms() -> None:
+            """Deletes VMs parked between submissions for longer than the idle timeout: they cost money while idle."""
+            while not stopping.is_set():
+                time.sleep(1)
+                try:
+                    retire_warm_vms(warm_idle, reserve)
+                except Exception:
+                    logger.exception('Deleting idle warm VMs failed; will retry')
+
+        def keep_warm_vms_awake() -> None:
+            """
+            Pings parked VMs so the platform never sees them idle: it pauses a VM idle for longer than its
+            auto-pause timeout, and a paused VM fails its health check when a submission takes it.
+            """
+            while not stopping.wait(KEEPALIVE_INTERVAL):
+                for record in vm_pool.parked():
+                    vm = VM(**record)
+                    try:
+                        requests.get(vm.url + '/health', headers=vm.headers, timeout=10)
+                    except requests.RequestException:
+                        pass  # a dead VM is found and replaced when a submission takes it
+
+        def create_standby_vm(label: str) -> None:
+            nonlocal standby_creating
+            try:
+                vm = warm_backend.create_vm(label, stopping)
+                vm_pool.own(vm.id)
+                if stopping.is_set() or not vm_pool.park(vm):
+                    # Nobody will take it: the judge is stopping (the final sweep may already have run), or the
+                    # pool has no room to park it.
+                    retire_warm_vm(vm._asdict())
+                    return
+            except Exception:
+                vm_pool.release()
+                if not stopping.is_set():
+                    logger.exception('Creating a standby VM failed; will retry')
+                    time.sleep(10)
+                return
+            finally:
+                with standby_lock:
+                    standby_creating -= 1
+
+        def keep_standby_vms() -> None:
+            """Tops the parked VMs up to the reserve as submissions take them."""
+            nonlocal standby_creating
+            n = 0
+            while not stopping.wait(1):
+                with standby_lock:
+                    if stopping.is_set():
+                        # Shutdown just reaped the parked VMs: that deficit must not be filled.
+                        return
+                    deficit = reserve - vm_pool.warm_count() - standby_creating
+                    for _ in range(deficit):
+                        if not vm_pool.acquire_standby():
+                            break  # the pool is full of grading VMs; try again later
+                        standby_creating += 1
+                        n += 1
+                        threading.Thread(
+                            target=create_standby_vm, args=(f'standby-{n}',), name='standby vm', daemon=True
+                        ).start()
+
+        if warm_idle > 0:
+            threading.Thread(target=reap_warm_vms, name='warm vm reaper', daemon=True).start()
+        if reserve > 0:
+            threading.Thread(target=keep_standby_vms, name='standby vms', daemon=True).start()
+            threading.Thread(target=keep_warm_vms_awake, name='warm vm keepalive', daemon=True).start()
+
+    judges = [
+        ClassicJudge(
+            judgeenv.server_host,
+            judgeenv.server_port,
+            name=name,
+            key=key,
+            vm_pool=vm_pool,
+            secure=judgeenv.secure,
+            no_cert_check=judgeenv.no_cert_check,
+            cert_store=judgeenv.cert_store,
+        )
+        for name, key in identities
+    ]
+    judge = judges[0]
+
+    def update_all_problems():
+        for each in judges:
+            each.update_problems()
+
     monitor = Monitor()
-    monitor.callback = judge.update_problems
+    monitor.callback = update_all_problems
 
     if hasattr(signal, 'SIGUSR2'):
 
         def update_problem_signal(signum, frame):
-            judge.update_problems()
+            update_all_problems()
 
         signal.signal(signal.SIGUSR2, update_problem_signal)
 
@@ -685,16 +869,49 @@ def main():  # pragma: no cover
     else:
         api_server = None
 
+    if judgeenv.env.remote_grading:
+        # `docker stop` sends SIGTERM: shut down like on Ctrl-C, so submissions are aborted and warm VMs deleted
+        # instead of running until the next start sweeps them.
+        def terminate(signum, frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, terminate)
+
     print()
     with monitor:
         try:
-            judge.listen()
+            # Every judge listens on its own thread; the main thread waits for any of them to stop (a `disconnect`
+            # from the site, or an exception), then shuts the process down: one judge can't stop by itself with
+            # warm and standby VMs shared by all of them.
+            listeners = [
+                threading.Thread(target=each.listen, name=f'judge {each.packet_manager.name}', daemon=True)
+                for each in judges
+            ]
+            for thread in listeners:
+                thread.start()
+            while all(thread.is_alive() for thread in listeners):
+                time.sleep(0.5)
+            logger.info('A judge stopped; shutting down')
         except KeyboardInterrupt:
             pass
         except Exception:
             traceback.print_exc()
         finally:
-            judge.murder()
+            for each in judges:
+                each.murder()
+            if vm_pool is not None:
+                # Parked VMs would otherwise run until the next start of this judge sweeps them. Standby VMs still
+                # being created notice `stopping` and are deleted by their creator, unless creation finished just
+                # before: those are parked and taken by the final sweep below.
+                stopping.set()
+                deadline = time.monotonic() + 120
+                while time.monotonic() < deadline:
+                    with standby_lock:
+                        if standby_creating == 0:
+                            break
+                    time.sleep(0.5)
+                for thread in retire_warm_vms(0, 0):
+                    thread.join()
             if api_server:
                 api_server.shutdown()
 

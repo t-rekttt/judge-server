@@ -31,7 +31,9 @@ from dmoj.utils.unicode import utf8bytes
 # from the cache.
 class _CompiledExecutorMeta(ExecutorMeta):
     def __call__(cls, *args, **kwargs) -> 'CompiledExecutor':
-        is_cached: bool = kwargs.pop('cached', False)
+        # `cache_all_compiled_binaries` also caches submissions, so a remote grading VM can hand them to other VMs.
+        # Only for executors whose cached form is fully described by `_executable` and `_dir` (see below).
+        is_cached: bool = kwargs.pop('cached', False) or bool(env.cache_all_compiled_binaries)
         if is_cached:
             kwargs['dest_dir'] = env.compiled_binary_cache_dir
 
@@ -45,12 +47,19 @@ class _CompiledExecutorMeta(ExecutorMeta):
 
             cache_file_path = os.path.join(tempfile.gettempdir(), cache_key + '.txt')
             if os.path.isfile(cache_file_path):
-                executor = open(cache_file_path).read().strip().split('\n')
+                # Two lines: the executable and the directory. The executable is empty for executors whose program
+                # is the directory's contents (Java), so don't strip the file as a whole.
+                executor = open(cache_file_path).read().split('\n')
                 assert len(executor) == 2
                 # Minimal sanity checking: is the file still there? If not, we'll just recompile.
-                if os.path.isfile(executor[0]):
+                if os.path.isfile(executor[0]) or (not executor[0] and os.path.isdir(executor[1])):
                     obj._executable = executor[0]
                     obj._dir = executor[1]
+                    if not getattr(cls, 'restorable_from_cache', False):
+                        # Executors that set run-time state while writing their sources (Java's class name,
+                        # Python's loader, Kotlin's jar name) write them again into the restored directory; the
+                        # compiled output next to them is untouched.
+                        obj.create_files(*args, **kwargs)
                     return obj
 
         obj.create_files(*args, **kwargs)
@@ -69,6 +78,10 @@ class CompiledExecutor(BaseExecutor, metaclass=_CompiledExecutorMeta):
     compile_output_index = 1
 
     is_cached = False
+    # Whether a cache hit, which restores `_executable` and `_dir`, yields a runnable executor without writing the
+    # sources again. False for executors that set other state while creating files (e.g. Java's class name,
+    # Python's loader path): on a hit they run `create_files` again, which must then be safe to repeat.
+    restorable_from_cache = False
     warning: Optional[bytes] = None
     _executable: Optional[str] = None
     _code: Optional[str] = None

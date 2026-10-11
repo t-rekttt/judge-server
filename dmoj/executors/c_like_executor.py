@@ -27,6 +27,7 @@ class CLikeExecutor(SingleDigitVersionMixin, CompiledExecutor):
     std: Optional[str] = None
     arch: str
     has_color = False
+    restorable_from_cache = True
 
     source_dict: Dict[str, bytes] = {}
 

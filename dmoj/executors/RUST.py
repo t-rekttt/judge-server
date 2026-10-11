@@ -1,8 +1,10 @@
 import fcntl
 import os
+import shutil
+from pathlib import PurePath
 from typing import List, Optional, Tuple, cast
 
-from dmoj.cptbox.filesystem_policies import ExactFile, RecursiveDir
+from dmoj.cptbox.filesystem_policies import ExactDir, ExactFile, FilesystemAccessRule, RecursiveDir
 from dmoj.executors.base_executor import BaseExecutor
 from dmoj.executors.compiled_executor import CompiledExecutor
 
@@ -55,7 +57,7 @@ class Executor(CompiledExecutor):
         self.shared_target: Optional[str] = None
 
     def create_files(self, problem_id, source_code, *args, **kwargs) -> None:
-        os.mkdir(self._file('src'))
+        os.makedirs(self._file('src'), exist_ok=True)
         with open(self._file('src', 'main.rs'), 'wb') as f:
             f.write(source_code)
 
@@ -109,6 +111,12 @@ class Executor(CompiledExecutor):
         assert command is not None
         return [('rustc', os.path.join(os.path.dirname(command), 'rustc'))]
 
+    def get_compiler_read_fs(self) -> List[FilesystemAccessRule]:
+        # Cargo canonicalizes the package path, which needs every directory above it: the sources sit under the
+        # compiled-binary cache directory when the executor is cached (checkers, remote grading).
+        assert self._dir is not None
+        return super().get_compiler_read_fs() + [ExactDir(str(parent)) for parent in PurePath(self._dir).parents]
+
     def get_compile_args(self) -> List[str]:
         command = self.get_command()
         assert command is not None
@@ -117,3 +125,13 @@ class Executor(CompiledExecutor):
 
     def get_compiled_file(self) -> str:
         return os.path.join(self.get_shared_target(), 'release/user_submission')
+
+    def compile(self) -> str:
+        executable = super().compile()
+        if self.is_cached:
+            # The build lands in the shared target, which other judges' builds overwrite and which doesn't travel
+            # with the cache directory (remote grading ships that to other VMs): keep the binary with the sources.
+            cached = self._file('user_submission')
+            shutil.copy2(executable, cached)
+            self._executable = executable = cached
+        return executable

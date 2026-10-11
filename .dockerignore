@@ -1,2 +1,7 @@
 .git
 *.pyc
+# Local build products; images already contain their own compiled modules.
+**/__pycache__
+*.so
+build
+*.egg-info
