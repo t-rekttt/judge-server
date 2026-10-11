@@ -60,3 +60,29 @@ class VMPoolTest(unittest.TestCase):
         # The child got the last slot (1) but not a third (no +10).
         self.assertEqual(result.value, 1)
         self.assertFalse(pool.acquire_extra(held=1))
+
+    def test_ownership_record_is_shared_with_forked_workers(self):
+        # Sessions record their VMs from forked workers; the sweeper reads the record in the main process.
+        pool = VMPool(3)
+        pool.own('vm-main')
+
+        def child():
+            pool.own('vm-child')
+            pool.disown('vm-main')
+
+        context = multiprocessing.get_context('fork')
+        process = context.Process(target=child)
+        process.start()
+        process.join(10)
+        self.assertEqual(pool.owned(), {'vm-child'})
+        pool.disown('vm-child')
+        self.assertEqual(pool.owned(), set())
+
+    def test_ownership_record_is_bounded_by_capacity(self):
+        pool = VMPool(2)
+        pool.own('a')
+        pool.own('b')
+        pool.own('c')  # no slot left: dropped, never raises
+        self.assertEqual(pool.owned(), {'a', 'b'})
+        pool.own('a')  # already recorded: no duplicate
+        self.assertEqual(pool.owned(), {'a', 'b'})

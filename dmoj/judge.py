@@ -705,11 +705,15 @@ def main():  # pragma: no cover
             """Deletes this judge's VMs that no submission owns: deletions that failed (API rate limits) and crashes."""
             from dmoj.remote.microvm_backend import SWEEP_INTERVAL
 
+            from dmoj.remote.session import MAX_SUBMISSION_SECONDS
+
             backend = make_backend(remote, env['id'])
             while True:
                 time.sleep(SWEEP_INTERVAL)
                 try:
-                    backend.delete_orphans(keep=vm_pool.owned())
+                    # A VM younger than the longest a submission can take is never swept, whatever the ownership
+                    # record says: a wrong deletion costs a submission, a late one only money.
+                    backend.delete_orphans(keep=vm_pool.owned(), min_age=MAX_SUBMISSION_SECONDS)
                 except Exception:
                     logger.exception('Sweeping leftover VMs failed; will retry')
 

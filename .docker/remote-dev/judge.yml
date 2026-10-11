@@ -13,6 +13,9 @@ remote:
   judge_count: 4
   max_concurrent_vms: 12
   max_vms: 0
+  # Sweep aggressively here, so the ownership record is exercised: a live runner swept = test failure.
+  sweep_interval: 5
+  sweep_min_age: 0
   backend: docker
   docker:
     image: vnoj/judge-microvm:dev

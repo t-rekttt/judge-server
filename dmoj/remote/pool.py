@@ -17,6 +17,9 @@ import threading
 import time
 from typing import Optional, Set
 
+# Bytes per owned-VM id slot: DigitalOcean ids are 36-character UUIDs, Docker ids 64 hex characters.
+OWNED_SLOT = 64
+
 
 class VMPool:
     def __init__(self, capacity: int) -> None:
@@ -25,17 +28,37 @@ class VMPool:
         self._active = multiprocessing.Value('i', 0)
         # Ids of VMs some submission owns right now, so a sweeper in the main process can tell this judge's leftover
         # VMs (whose submission ended but whose deletion failed, e.g. under API rate limiting) from live ones.
-        self._manager = multiprocessing.Manager()
-        self._owned = self._manager.dict()
+        # Plain shared memory: sessions run in processes forked after this pool is built, and a Manager proxy
+        # inherited across the fork proved unreliable there, which let the sweeper delete VMs in use.
+        self._owned = multiprocessing.Array('c', OWNED_SLOT * capacity)
+        self._owned_lock = multiprocessing.Lock()
 
     def own(self, vm_id: str) -> None:
-        self._owned[vm_id] = True
+        key = vm_id.encode()[:OWNED_SLOT]
+        with self._owned_lock:
+            free = None
+            for i in range(self.capacity):
+                slot = self._slot(i)
+                if slot == key:
+                    return
+                if not slot and free is None:
+                    free = i
+            if free is not None:
+                self._owned[free * OWNED_SLOT : free * OWNED_SLOT + len(key)] = key
 
     def disown(self, vm_id: str) -> None:
-        self._owned.pop(vm_id, None)
+        key = vm_id.encode()[:OWNED_SLOT]
+        with self._owned_lock:
+            for i in range(self.capacity):
+                if self._slot(i) == key:
+                    self._owned[i * OWNED_SLOT : (i + 1) * OWNED_SLOT] = b'\0' * OWNED_SLOT
 
     def owned(self) -> Set[str]:
-        return set(self._owned.keys())
+        with self._owned_lock:
+            return {self._slot(i).decode() for i in range(self.capacity) if self._slot(i)}
+
+    def _slot(self, i: int) -> bytes:
+        return bytes(self._owned[i * OWNED_SLOT : (i + 1) * OWNED_SLOT]).rstrip(b'\0')
 
     def register(self) -> None:
         """A submission starts grading."""

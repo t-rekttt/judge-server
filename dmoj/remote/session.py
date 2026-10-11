@@ -38,8 +38,11 @@ SETUP_TIMEOUT = 600  # seconds, for downloading the problem and compiling
 # How long grading may wait at the end for VM creations to notice they're cancelled: one API call with retries.
 CREATE_CANCEL_TIMEOUT = 120  # seconds
 # Responses from the platform's endpoint in front of a runner, not from the runner, retried this long after a VM starts.
+# Under load the endpoint has refused for well over a minute ("RBAC: access denied").
 GATEWAY_STATUSES = (403, 502, 503, 504)
-GATEWAY_RETRY_SECONDS = 30
+GATEWAY_RETRY_SECONDS = 180
+# The longest a submission can take end to end, used to tell a VM in use from one left behind.
+MAX_SUBMISSION_SECONDS = 2 * SETUP_TIMEOUT + 3600
 
 
 class RemoteGradingError(Exception):
@@ -74,9 +77,15 @@ class Runner:
             raise RemoteGradingError(f'runner {self.vm.id} {path} failed ({response.status_code}): {response.text}')
 
     def download_artifact(self) -> bytes:
-        response = self.http.get(self.vm.url + '/artifact', timeout=SETUP_TIMEOUT, headers=self.headers)
-        response.raise_for_status()
-        return response.content
+        deadline = time.monotonic() + GATEWAY_RETRY_SECONDS
+        while True:
+            response = self.http.get(self.vm.url + '/artifact', timeout=SETUP_TIMEOUT, headers=self.headers)
+            if response.status_code == 200:
+                return response.content
+            if response.status_code in GATEWAY_STATUSES and time.monotonic() < deadline:
+                time.sleep(1)
+                continue
+            raise RemoteGradingError(f'runner {self.vm.id} /artifact failed ({response.status_code})')
 
 
 class RemoteGradingSession:

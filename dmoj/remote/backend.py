@@ -45,8 +45,11 @@ class VMBackend:
     def delete_vm(self, vm: VM) -> None:
         raise NotImplementedError
 
-    def delete_orphans(self, keep: Optional[Set[str]] = None) -> int:
-        """Deletes this judge's VMs that no submission owns (all of them, unless their ids are in `keep`)."""
+    def delete_orphans(self, keep: Optional[Set[str]] = None, min_age: float = 0) -> int:
+        """
+        Deletes this judge's VMs that no submission owns: all of them, unless their ids are in `keep` or they are
+        younger than `min_age` seconds.
+        """
         raise NotImplementedError
 
 
@@ -141,12 +144,14 @@ class DockerBackend(VMBackend):
         except Exception:
             logger.exception('Failed to delete runner %s', vm.id)
 
-    def delete_orphans(self, keep: Optional[Set[str]] = None) -> int:
+    def delete_orphans(self, keep: Optional[Set[str]] = None, min_age: float = 0) -> int:
         filters = urllib.parse.quote(json.dumps({'label': [f'dmoj.judge={self.judge_id}']}))
         deleted = 0
         for container in self._call('GET', f'/containers/json?all=true&filters={filters}') or []:
             names = [name.lstrip('/') for name in container.get('Names', [])]
             if keep and (container['Id'] in keep or any(name in keep for name in names)):
+                continue
+            if min_age and time.time() - float(container.get('Created') or 0) < min_age:
                 continue
             logger.warning('Deleting runner %s that no submission owns', container['Id'][:12])
             self.delete_vm(VM(container['Id'], '', ''))

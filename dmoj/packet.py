@@ -285,9 +285,9 @@ class PacketManager:
                 self._dead.add(conn)
             with self._testcase_queue_lock:
                 self._testcase_queue.clear()
-            # Aborting waits for the grading worker, whose sends return at once now that the connection is marked
-            # dead; without that, the abort and the worker's next send would wait on each other.
-            self.judge.abort_grading()
+            # The submission in flight is lost either way; stop its worker in the background. Waiting for it here
+            # (it can take up to a minute to exit) would hold up reconnecting and reading the site's next packets.
+            threading.Thread(target=self.judge.abort_grading, name='abort after disconnect', daemon=True).start()
             self._reconnect()
             with self._lock:
                 self._dead.discard(conn)

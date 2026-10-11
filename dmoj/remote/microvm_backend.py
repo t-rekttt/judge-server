@@ -12,6 +12,7 @@ runner's own token goes in `X-Runner-Token`.
 Every VM is tagged with the judge it belongs to, so a restarted judge deletes VMs it left behind (`delete_orphans`).
 """
 
+import datetime
 import logging
 import random
 import re
@@ -195,9 +196,22 @@ class MicroVMBackend(VMBackend):
             page += 1
         return vms
 
-    def delete_orphans(self, keep: Optional[Set[str]] = None) -> int:
-        """Deletes this judge's VMs except those in `keep` (ids of VMs sessions still own). Returns how many."""
-        orphans = [vm['id'] for vm in self.list_vms() if vm['id'] not in (keep or set())]
+    def delete_orphans(self, keep: Optional[Set[str]] = None, min_age: float = 0) -> int:
+        """
+        Deletes this judge's VMs except those in `keep` (ids of VMs sessions still own) and those younger than
+        `min_age` seconds, which may belong to a submission that hasn't recorded them yet. Returns how many.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        orphans = []
+        for vm in self.list_vms():
+            if vm['id'] in (keep or set()):
+                continue
+            created = vm.get('created_at')
+            if min_age and created:
+                age = (now - datetime.datetime.fromisoformat(created.replace('Z', '+00:00'))).total_seconds()
+                if age < min_age:
+                    continue
+            orphans.append(vm['id'])
         if orphans:
             logger.warning('Deleting %d MicroVMs of this judge that no submission owns', len(orphans))
         for vm_id in orphans:
