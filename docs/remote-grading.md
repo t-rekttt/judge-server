@@ -122,7 +122,7 @@ remote:
   max_concurrent_vms: 100 # VMs the whole process may run at once, shared by its judges
   max_vms: 0              # per-submission cap on VMs; 0 = none
   warm_idle_seconds: 10   # keep a finished submission's VMs this long for the next one; 0 = delete at once
-  warm_reserve_per_judge: 2  # parked VMs kept ready per judge at all times (16 here); 0 = none
+  warm_reserve_per_judge: 0  # VMs kept running per judge at all times; 0 = none (they cost money while idle)
   backend: microvm        # or `docker` (local runner containers)
   microvm:
     api_token: dop_v1_... # scopes: microvm:create, microvm:read, microvm:delete, microvm:access
