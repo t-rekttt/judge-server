@@ -276,3 +276,77 @@ class RemoteSessionCleanupTest(unittest.TestCase):
         self.assertEqual(messages[-1], 'GRADING_END')
         # All 4 VMs existed by the time the slow first case finished.
         self.assertEqual(created_before_first_grade, [4])
+
+
+class CreationStopsOnAbortTest(unittest.TestCase):
+    # 2026-10-14: a submission aborted while VMs were being created left 14 MicroVMs running.
+
+    def test_no_vm_is_created_once_cancelled_while_rate_limited(self):
+        # Under rate limiting a creation request waits its turn; if the submission is aborted meanwhile, the request
+        # must not go out at all.
+        from types import SimpleNamespace
+
+        from dmoj.remote.microvm_backend import MicroVMBackend
+        from dmoj.remote.rate_limit import RateLimiter
+
+        config = SimpleNamespace(
+            api_url='https://api.example',
+            api_token='t',
+            access_token=None,
+            region='mkc1',
+            image='img:1',
+            checkpoint_id=None,
+            checkpoint_runner_token=None,
+            cpus=1,
+            memory_mb=2048,
+            vpc_uuid=None,
+            endpoint_scheme='https',
+            ready_timeout=5,
+        )
+        backend = MicroVMBackend(config, 'judge')
+        limiter = RateLimiter()
+        limiter._minute_used.value = limiter.minute_limit  # this minute's budget is spent: calls wait
+        backend._limiter = limiter
+        backend._http = mock.Mock()
+
+        cancelled = threading.Event()
+        threading.Timer(0.3, cancelled.set).start()
+        started = time.monotonic()
+        with self.assertRaises(CreationCancelled):
+            backend.create_vm('7-2', cancelled)
+        self.assertLess(time.monotonic() - started, 3)
+        backend._http.request.assert_not_called()
+
+
+class ReclaimTest(unittest.TestCase):
+    def test_reclaim_returns_a_killed_workers_vms_and_slots(self):
+        import os
+
+        from dmoj.remote.pool import VMPool
+
+        pool = VMPool(4)
+        main = os.getpid()
+        worker = os.fork()
+        if worker == 0:  # a grading worker: two VMs on two slots, then it is "killed"
+            pool.acquire_first()
+            pool.note_held(1)
+            pool.own('a')
+            pool.acquire_extra(1)
+            pool.note_held(1)
+            pool.own('b')
+            os._exit(0)
+        os.waitpid(worker, 0)
+        # The main process parks a standby VM: it belongs to the pool, not to any worker.
+        pool.acquire_standby()
+        pool.own('standby')
+        pool.park(VM('standby', 'http://standby', 't'))
+
+        self.assertEqual(sorted(pool.reclaim(worker)), ['a', 'b'])
+        self.assertEqual(pool.owned(), {'standby'})
+        self.assertEqual(pool.reclaim(worker), [])  # once only
+        self.assertEqual(pool.reclaim(main), [])
+        # Both slots came back; the standby VM still holds its own.
+        self.assertTrue(pool.acquire_extra(0))
+        self.assertTrue(pool.acquire_extra(0))
+        self.assertTrue(pool.acquire_extra(0))
+        self.assertFalse(pool.acquire_extra(0))
