@@ -199,6 +199,7 @@ class RemoteGradingSession:
                 continue
             with self._lock:
                 self._slots += 1
+            self.pool.note_held(1)
             try:
                 return self._create_runner(label)
             except BaseException:
@@ -217,6 +218,8 @@ class RemoteGradingSession:
             self._delete_vm(vm)
             self.pool.release()
             raise RemoteGradingError('aborted')
+        self.pool.own(vm.id)
+        self.pool.note_held(1)
         runner = Runner(vm, self._http)
         if runner.healthy():
             return runner
@@ -254,6 +257,7 @@ class RemoteGradingSession:
             # The slot now belongs to the parked VM: the reaper releases it when the VM is deleted.
             with self._lock:
                 self._slots -= 1
+            self.pool.note_held(-1)
         else:
             self._delete_and_release(vm)
 
@@ -266,6 +270,8 @@ class RemoteGradingSession:
         with self._lock:
             count = min(count, self._slots)
             self._slots -= count
+        if count:
+            self.pool.note_held(-count)
         for _ in range(count):
             self.pool.release()
 

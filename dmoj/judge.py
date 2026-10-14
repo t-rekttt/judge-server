@@ -332,6 +332,7 @@ class JudgeWorker:
         self.vm_pool = vm_pool
         self._abort_requested = False
         self._sent_sigkill_to_worker_process = False
+        self._reclaimed = False
         # FIXME(tbrindus): marked Any pending grader cleanups.
         self.grader: Any = None
         self.remote_session: Any = None
@@ -374,6 +375,11 @@ class JudgeWorker:
                 yield ipc_type, data
 
     def wait_with_timeout(self) -> None:
+        if self.worker_process and not self.worker_process.is_alive():
+            # Killed earlier (a worker that stopped answering), or exited on its own.
+            if self.worker_process.exitcode == -signal.SIGKILL:
+                self._reclaim_remote_vms()
+            return
         if self.worker_process and self.worker_process.is_alive():
             # Might be None if run was never called, or failed.
             try:
@@ -385,6 +391,31 @@ class JudgeWorker:
                     logger.error('Worker is still alive, sending SIGKILL!')
                     self._sent_sigkill_to_worker_process = True
                     self.worker_process.kill()
+                if self.worker_process.exitcode == -signal.SIGKILL:
+                    self._reclaim_remote_vms()
+
+    def _reclaim_remote_vms(self) -> None:
+        """
+        A killed worker can't delete its VMs, and the sweeper only deletes VMs older than the longest a submission can
+        take: delete them here, in the background, so the judge can take its next submission at once.
+        """
+        if self.vm_pool is None or self.worker_process.pid is None or self._reclaimed:
+            return
+        self._reclaimed = True
+        self.worker_process.join(timeout=5)  # the pid must not be reused before its records are taken back
+        vm_ids = self.vm_pool.reclaim(self.worker_process.pid)
+        if not vm_ids:
+            return
+        logger.warning('Deleting %d VMs of the killed worker for submission %d', len(vm_ids), self.submission.id)
+
+        def delete() -> None:
+            from dmoj.remote.backend import VM, make_backend
+
+            backend = make_backend(env.remote, env['id'])
+            for vm_id in vm_ids:
+                backend.delete_vm(VM(vm_id, '', ''))  # never raises; a failed deletion is left to the sweeper
+
+        threading.Thread(target=delete, name='reclaim vms', daemon=True).start()
 
     def request_abort_grading(self) -> None:
         assert self.worker_process_conn

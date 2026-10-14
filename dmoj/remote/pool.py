@@ -21,6 +21,7 @@ Rules:
 import json
 import logging
 import multiprocessing
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -43,6 +44,11 @@ class VMPool:
         # Plain shared memory: sessions run in processes forked after this pool is built, and a Manager proxy
         # inherited across the fork proved unreliable there, which let the sweeper delete VMs in use.
         self._owned = multiprocessing.Array('c', OWNED_SLOT * capacity)
+        # The pid of the process using each owned VM, 0 for a parked one. If the judge has to kill a grading worker,
+        # it gives back that worker's VMs by this (see `reclaim`): the worker can't, and nobody else would.
+        self._owners = multiprocessing.Array('i', capacity)
+        # Slots each grading process holds, as (pid, count) pairs, for the same reason.
+        self._holders = multiprocessing.Array('i', 2 * capacity)
         self._owned_lock = multiprocessing.Lock()
         # Parked VMs, each with the time it was parked. Same shared memory as the ownership record, for the same
         # reason; a parked VM stays in the ownership record until it is deleted.
@@ -50,18 +56,22 @@ class VMPool:
         self._warm_since = multiprocessing.Array('d', capacity)
         self._warm_lock = multiprocessing.Lock()
 
-    def own(self, vm_id: str) -> None:
+    def own(self, vm_id: str, owner: Optional[int] = None) -> None:
+        """Records a VM as in use by `owner` (this process by default). Recording it again changes its owner."""
         key = vm_id.encode()[:OWNED_SLOT]
+        owner = os.getpid() if owner is None else owner
         with self._owned_lock:
             free = None
             for i in range(self.capacity):
                 slot = self._slot(i)
                 if slot == key:
+                    self._owners[i] = owner
                     return
                 if not slot and free is None:
                     free = i
             if free is not None:
                 self._owned[free * OWNED_SLOT : free * OWNED_SLOT + len(key)] = key
+                self._owners[free] = owner
 
     def disown(self, vm_id: str) -> None:
         key = vm_id.encode()[:OWNED_SLOT]
@@ -69,6 +79,7 @@ class VMPool:
             for i in range(self.capacity):
                 if self._slot(i) == key:
                     self._owned[i * OWNED_SLOT : (i + 1) * OWNED_SLOT] = b'\0' * OWNED_SLOT
+                    self._owners[i] = 0
 
     def owned(self) -> Set[str]:
         with self._owned_lock:
@@ -76,6 +87,44 @@ class VMPool:
 
     def _slot(self, i: int) -> bytes:
         return bytes(self._owned[i * OWNED_SLOT : (i + 1) * OWNED_SLOT]).rstrip(b'\0')
+
+    def note_held(self, delta: int) -> None:
+        """This process now holds `delta` more (or fewer) slots. Lets `reclaim` give back a killed process's slots."""
+        pid = os.getpid()
+        with self._owned_lock:
+            free = None
+            for i in range(self.capacity):
+                if self._holders[2 * i] == pid:
+                    self._holders[2 * i + 1] += delta
+                    if self._holders[2 * i + 1] <= 0:
+                        self._holders[2 * i] = self._holders[2 * i + 1] = 0
+                    return
+                if not self._holders[2 * i] and free is None:
+                    free = i
+            if free is not None and delta > 0:
+                self._holders[2 * free] = pid
+                self._holders[2 * free + 1] = delta
+
+    def reclaim(self, pid: int) -> List[str]:
+        """
+        Takes back what a grading process that was killed held: releases its slots and disowns its VMs, whose ids are
+        returned for the caller to delete. A VM it was still creating isn't recorded yet; the sweeper deletes that one.
+        """
+        with self._owned_lock:
+            vm_ids = []
+            for i in range(self.capacity):
+                if self._owners[i] == pid and self._slot(i):
+                    vm_ids.append(self._slot(i).decode())
+                    self._owned[i * OWNED_SLOT : (i + 1) * OWNED_SLOT] = b'\0' * OWNED_SLOT
+                    self._owners[i] = 0
+            held = 0
+            for i in range(self.capacity):
+                if self._holders[2 * i] == pid:
+                    held = self._holders[2 * i + 1]
+                    self._holders[2 * i] = self._holders[2 * i + 1] = 0
+        for _ in range(held):
+            self.release()
+        return vm_ids
 
     def register(self) -> None:
         """A submission starts grading."""
@@ -132,8 +181,14 @@ class VMPool:
                 if not self._warm_record(i):
                     self._warm[i * WARM_SLOT : i * WARM_SLOT + len(record)] = record
                     self._warm_since[i] = time.monotonic()
-                    return True
-        return False
+                    parked = True
+                    break
+            else:
+                parked = False
+        if parked:
+            # Owned by nobody while parked: a submission that takes it records it again (see `own`).
+            self.own(vm.id, owner=0)
+        return parked
 
     def take_warm(self) -> Optional[Dict[str, Any]]:
         """The most recently parked VM, as `VM` fields, with its slot; None if there is none."""

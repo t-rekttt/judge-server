@@ -92,12 +92,23 @@ class MicroVMBackend(VMBackend):
         self._http.mount('http://', adapter)
 
     def _api(
-        self, method: str, path: str, ok=(200, 201, 204), attempts: int = API_ATTEMPTS, **kwargs
+        self,
+        method: str,
+        path: str,
+        ok=(200, 201, 204),
+        attempts: int = API_ATTEMPTS,
+        cancelled: Optional[threading.Event] = None,
+        **kwargs,
     ) -> requests.Response:
-        """Calls the API at the rate limiter's pace, retrying rate limiting and server errors with backoff."""
+        """
+        Calls the API at the rate limiter's pace, retrying rate limiting and server errors with backoff. If `cancelled`
+        is set before a request goes out, raises `CreationCancelled` instead of sending it.
+        """
         delay = 1.0
         for attempt in range(1, attempts + 1):
-            self._limiter.wait()
+            self._limiter.wait(cancelled)
+            if cancelled is not None and cancelled.is_set():
+                raise CreationCancelled(f'{method} {path} was cancelled')
             try:
                 response = self._http.request(method, self.api_url + path, timeout=30, **kwargs)
             except requests.RequestException as error:
@@ -152,7 +163,9 @@ class MicroVMBackend(VMBackend):
             request['environment'] = {'JUDGE_MODE': 'runner', 'RUNNER_TOKEN': token}
         assert token is not None
 
-        microvm = self._api('POST', '/v2/microvms', json=request).json()['microvm']
+        # Checked again right before the request: the rate limiter may hold this call for a while, and a VM created
+        # after the submission was aborted is one nobody will use.
+        microvm = self._api('POST', '/v2/microvms', json=request, cancelled=cancelled).json()['microvm']
         vm_id = microvm['id']
         try:
             hostname = self._wait_until_running(vm_id, microvm, cancelled)

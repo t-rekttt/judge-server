@@ -39,9 +39,14 @@ class RateLimiter:
         # Earliest time the next call may go, so calls are spaced instead of released together.
         self._next_at = multiprocessing.Value('d', 0.0)
 
-    def wait(self) -> None:
-        """Blocks until this call fits the pace, then takes its place in both windows."""
+    def wait(self, cancelled: Optional[threading.Event] = None) -> None:
+        """
+        Blocks until this call fits the pace, then takes its place in both windows. Returns early, without taking a
+        place, if `cancelled` is set while waiting: the caller then doesn't make the call.
+        """
         while True:
+            if cancelled is not None and cancelled.is_set():
+                return
             with self._lock:
                 now = time.time()
                 if now >= self._minute_start.value + 60:
@@ -57,7 +62,10 @@ class RateLimiter:
                     self._remaining.value = max(0, self._remaining.value - 1)
                     self._next_at.value = now + self._spacing(now)
                     return
-            time.sleep(min(delay, 5.0))
+            if cancelled is not None:
+                cancelled.wait(min(delay, 5.0))
+            else:
+                time.sleep(min(delay, 5.0))
 
     def _delay(self, now: float) -> float:
         """Seconds until the next call may go, 0 if now."""
